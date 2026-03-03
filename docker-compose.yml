@@ -38,9 +38,9 @@ services:
     image: rabbitmq:3-management
     container_name: zabota_avito_bot_rabbitmq
     restart: always
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    # ports:
+    #   - "5672:5672"
+    #   - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: user
       RABBITMQ_DEFAULT_PASS: password
