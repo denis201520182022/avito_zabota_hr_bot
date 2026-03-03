@@ -55,6 +55,7 @@ class AvitoConnectorService:
             try:
                 stmt = select(Account).filter_by(platform="avito", is_active=True)
                 accounts = (await db.execute(stmt)).scalars().all()
+                logger.info(f"🔍 [Webhooks] Найдено {len(accounts)} активных аккаунтов в БД.")
                 for acc in accounts:
                     await avito.check_and_register_webhooks(acc, db, target_url)
             except Exception as e:
@@ -68,6 +69,10 @@ class AvitoConnectorService:
                 async with AsyncSessionLocal() as db:
                     stmt = select(Account).filter_by(platform="avito", is_active=True)
                     accounts = (await db.execute(stmt)).scalars().all()
+                    if accounts:
+                        logger.info(f"🕒 [Polling] Опрашиваю {len(accounts)} аккаунтов на наличие новых откликов...")
+                    else:
+                        logger.warning("⚠️ [Polling] В базе 0 активных аккаунтов Avito. Некого опрашивать.")
                     tasks = [self._poll_single_account(acc, db) for acc in accounts]
                     await asyncio.gather(*tasks)
             except Exception as e:
@@ -79,6 +84,10 @@ class AvitoConnectorService:
     async def _poll_single_account(self, account: Account, db: AsyncSession):
         try:
             new_apps = await avito.get_new_applications(account, db)
+            if new_apps:
+                logger.info(f"✅ Аккаунт {account.name}: Найдено {len(new_apps)} новых откликов!")
+            else:
+                logger.debug(f"🔎 Аккаунт {account.name}: Новых откликов нет.")
             for app_data in new_apps:
                 await self.process_avito_event({
                     "source": "avito_poller",
@@ -212,6 +221,7 @@ class AvitoConnectorService:
 
     async def process_avito_event(self, raw_data: dict):
         source = raw_data.get("source")
+        logger.info(f"📩 [Event] Получено событие из источника: {source}")
         payload = raw_data.get("payload", {})
         
         avito_user_id = raw_data.get("avito_user_id") 
@@ -251,6 +261,7 @@ class AvitoConnectorService:
             item_id = raw_data.get("vacancy_id")
 
         async with AsyncSessionLocal() as db:
+            logger.info(f"👤 Обработка чата {external_chat_id} для аккаунта ID {account_id}")
             # Находим наш аккаунт
             if source == "avito_webhook":
                 account = await db.scalar(select(Account).filter(Account.auth_data['user_id'].astext == str(avito_user_id)))
