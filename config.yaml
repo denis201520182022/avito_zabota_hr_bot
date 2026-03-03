@@ -1,0 +1,87 @@
+# Основные настройки идентификации
+bot_id: "avito_hr_zabota"
+bot_role_name: "Сотрудник отдела подбора"
+
+# Настройки каналов (на будущее)
+channels:
+  active_platforms: ["avito"] # Можно добавить "hh", когда будет готово
+  
+
+# LLM (ОЧЕНЬ ВАЖНО)
+llm:
+  main_model: "gpt-4o-mini"
+  smart_model: "gpt-4o"
+  temperature: 0.0
+  
+  max_tokens: 2500 # Макс. токенов для ответа
+  request_timeout: 600 # Таймаут для OpenAI
+
+# Настройки семафоров, лимитов, пачек в обработке, паралельность
+
+# Переключатели функций
+features:
+  enable_outbound_search: false    # Включить/выключить поиск по базе и инициацию
+  vacancy_description_source: "platform" # "platform" (из Авито) или "google_doc"
+  send_tg_interview_cards: true    # Отправлять ли карточку кандидата в ТГ после записи
+
+# База знаний (Google Docs)
+knowledge_base:
+  prompt_doc_url: "https://docs.google.com/document/d/1hMj6tX5-YY3PQy3MXUyl1ePADi1Lim9DN2KJDZXSs-8/edit"
+  credentials_json: "credentials.json"
+  cache_ttl: 300 # 5 минут в редисе
+
+# Работа с таблицами (Google Sheets)
+google_sheets:
+  spreadsheet_url: "https://docs.google.com/spreadsheets/d/1-i3DRRXLe8BFrWdsHvl1pNZBn8jcHWZUYk4e-tceXZ8/edit"
+  calendar_sheet_name: "Calendar"
+  candidates_sheet_name: "Candidates"
+
+# Логика напоминаний
+reminders:
+  silence:
+    enabled: true # Добавлен флаг, чтобы можно было отключить всех молчунов
+    quiet_time:
+      enabled: true
+      start: "20:30" # Не писать после этого времени
+      end: "09:00"   # Не писать раньше этого времени
+      default_timezone: "Europe/Moscow" # Если пояс кандидата неизвестен
+    levels: # Изменена структура для большей ясности
+      - delay_minutes: 30
+        text: | # Используем | для сохранения всех переносов строк
+          Напишу вам ещё раз, вдруг моё прошлое сообщение затерялось где-то между делами:-).
+          Вакансия интересна или что-то смутило? Если что-то смущает, попробую разъяснить спорные моменты и подобрать для вас варианты .
+      - delay_minutes: 180
+        text: |
+          Пишу вам ещё раз, вдруг не увидели предыдущее сообщение. Если вам сейчас неудобно или вы думаете -  напишите, пожалуйста, чтобы я понимала, как лучше вам помочь.
+        stop_bot: true
+
+  interview:
+    enabled: true
+    items:
+      - id: "evening_before"
+        type: "fixed_time"
+        days_before: 1
+        at_time: "19:00"
+        text: | # Используем | для сохранения всех переносов строк и плейсхолдеров
+          Добрый вечер! Напоминаю, что завтра, {interview_date} в {interview_time} 
+          по московскому времени, у вас назначено собеседование по вакансии '{vacancy_title}'. 
+          Если у вас есть вопросы, напишите нам.
+
+      - id: "one_hour_before"
+        type: "relative"
+        minutes_before: 120
+        text: | # Используем | для сохранения всех переносов строк и плейсхолдеров
+          Здравствуйте! Напоминаю, что у вас запланировано собеседование по вакансии 
+          '{vacancy_title}' сегодня в {interview_time} по московскому времени. 
+          Пожалуйста, будьте готовы.
+
+# Фразы бота (новые)
+messages:
+  initial_greeting: | # Приветствие при первом контакте
+    Здравствуйте! Подскажите, хотите ли Вы уточнить какие-то детали по вакансии перед тем, как мы перейдём к записи на собеседование?
+
+  qualification_failed_farewell: | # Прощание при провальной квалификации
+    Спасибо! Я передам Вашу анкету для рассмотрения. Если по Вашей анкете будет принято положительное решение с Вами свяжутся в течение трёх рабочих дней.
+
+
+

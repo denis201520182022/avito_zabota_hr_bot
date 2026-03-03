@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # === ОСНОВНОЕ ПРИЛОЖЕНИЕ (All-in-One) ===
+  app:
+    build: .
+    container_name: avito_hr_bot
+    restart: always
+    env_file:
+      - .env
+    # --- ДОБАВЬ ВОТ ЭТОТ БЛОК ---
+    environment:
+      # Переопределяем хосты для внутренней сети Docker
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      # Важно: переписываем полные URL, так как бот может использовать их
+      - DATABASE_URL=postgresql+asyncpg://ozer_user:jkbfwfg283trwfig@pgbouncer:6432/ozer_bot_db
+      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
+      # Обрати внимание: порт Redis внутри сети - 6379 (6381 только снаружи)
+      - REDIS_URL=redis://redis:6379/0
+    # ---------------------------
+    volumes:
+      - ./logs:/app/logs  # Логи пишутся в папку logs в корне проекта
+    ports:
+      - "8005:8000"       # FastAPI порт
+    depends_on:
+      rabbitmq:
+        condition: service_healthy  # Ждать успешного прохождения healthcheck
+      redis:
+        condition: service_healthy  # Ждать готовности Redis
+      pgbouncer:
+        condition: service_started  # PgBouncer просто запущен (или тоже добавьте healthcheck)
+    networks:
+      - avito_net
+
+  # === RABBITMQ (Очереди) ===
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: avito_bot_rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    volumes:
+      - avito_rabbitmq_data:/var/lib/rabbitmq # Железное сохранение очередей
+    networks:
+      - avito_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # === REDIS (Кэш и Локи) ===
+  redis:
+    image: redis:7-alpine
+    container_name: avito_bot_redis
+    restart: always
+    # Включаем AOF (Append Only File) для надежности данных при перезагрузке
+    command: redis-server --appendonly yes
+    ports:
+      - "6381:6379"
+    volumes:
+      - avito_redis_data:/data # Железное сохранение данных
+    networks:
+      - avito_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # === PGBOUNCER (Пул коннектов к БД) ===
+  pgbouncer:
+    image: edoburu/pgbouncer
+    container_name: avito_bot_pgbouncer
+    restart: always
+    environment:
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=host.docker.internal
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME}
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=1000
+      - DEFAULT_POOL_SIZE=20
+      - LISTEN_PORT=6432
+      - AUTH_TYPE=scram-sha-256
+      - IGNORE_STARTUP_PARAMETERS=extra_float_digits,client_encoding
+    ports:
+      - "6434:6432"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - avito_net
+
+# Объявление томов для сохранения данных
+volumes:
+  avito_rabbitmq_data:
+  avito_redis_data:
+
+# Сеть для общения контейнеров
+networks:
+  avito_net:
+    driver: bridge
