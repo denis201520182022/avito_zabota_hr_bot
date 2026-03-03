@@ -22,7 +22,7 @@ services:
     volumes:
       - ./logs:/app/logs  # Логи пишутся в папку logs в корне проекта
     ports:
-      - "8005:8000"       # FastAPI порт
+      - "8006:8000"       # FastAPI порт
     depends_on:
       rabbitmq:
         condition: service_healthy  # Ждать успешного прохождения healthcheck
@@ -61,8 +61,7 @@ services:
     restart: always
     # Включаем AOF (Append Only File) для надежности данных при перезагрузке
     command: redis-server --appendonly yes
-    ports:
-      - "6381:6379"
+    
     volumes:
       - avito_redis_data:/data # Железное сохранение данных
     networks:
@@ -90,8 +89,8 @@ services:
       - LISTEN_PORT=6432
       - AUTH_TYPE=scram-sha-256
       - IGNORE_STARTUP_PARAMETERS=extra_float_digits,client_encoding
-    ports:
-      - "6434:6432"
+    # ports:
+    #   - "6435:6432"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
