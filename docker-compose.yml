@@ -4,7 +4,7 @@ services:
   # === ОСНОВНОЕ ПРИЛОЖЕНИЕ (All-in-One) ===
   app:
     build: .
-    container_name: avito_hr_bot
+    container_name: zabota_hr_bot
     restart: always
     env_file:
       - .env
@@ -14,7 +14,7 @@ services:
       - DB_HOST=pgbouncer
       - DB_PORT=6432
       # Важно: переписываем полные URL, так как бот может использовать их
-      - DATABASE_URL=postgresql+asyncpg://ozer_user:jkbfwfg283trwfig@pgbouncer:6432/ozer_bot_db
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@pgbouncer:6432/${DB_NAME}
       - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
       # Обрати внимание: порт Redis внутри сети - 6379 (6381 только снаружи)
       - REDIS_URL=redis://redis:6379/0
@@ -36,7 +36,7 @@ services:
   # === RABBITMQ (Очереди) ===
   rabbitmq:
     image: rabbitmq:3-management
-    container_name: avito_bot_rabbitmq
+    container_name: zabota_avito_bot_rabbitmq
     restart: always
     ports:
       - "5672:5672"
@@ -57,7 +57,7 @@ services:
   # === REDIS (Кэш и Локи) ===
   redis:
     image: redis:7-alpine
-    container_name: avito_bot_redis
+    container_name: zabota_avito_bot_redis
     restart: always
     # Включаем AOF (Append Only File) для надежности данных при перезагрузке
     command: redis-server --appendonly yes
@@ -76,7 +76,7 @@ services:
   # === PGBOUNCER (Пул коннектов к БД) ===
   pgbouncer:
     image: edoburu/pgbouncer
-    container_name: avito_bot_pgbouncer
+    container_name: zabota_avito_bot_pgbouncer
     restart: always
     environment:
       - DB_USER=${DB_USER}
