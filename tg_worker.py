@@ -88,7 +88,10 @@ def format_history_txt(dialogue: Dialogue, candidate: Candidate, vacancy: JobCon
     for entry in (dialogue.history or []):
         role = entry.get('role')
         content = entry.get('content', '')
-        if not content or str(content).startswith('[SYSTEM'):
+        content_str = str(content)
+        
+        # ФИЛЬТР: Пропускаем пустые, системные команды [SYSTEM и мусор [Системное сообщение]
+        if not content_str or content_str.startswith('[SYSTEM') or content_str.startswith('[Системное сообщение]'):
             continue
             
         ts = entry.get('timestamp_utc', '')

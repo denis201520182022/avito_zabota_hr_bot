@@ -65,7 +65,10 @@ class Engine:
         for entry in (dialogue.history or []):
             role = "👤 Кандидат" if entry.get('role') == 'user' else "🤖 Бот"
             content = entry.get('content', '')
-            if not str(content).startswith('[SYSTEM'): # Пропускаем системные команды
+            content_str = str(content)
+            
+            # ФИЛЬТР: Пропускаем и системные команды бота, и мусор Авито
+            if not content_str.startswith('[SYSTEM') and not content_str.startswith('[Системное сообщение]'):
                 lines.append(f"{role}: {content}")
         return "\n".join(lines)
     
@@ -106,6 +109,19 @@ class Engine:
             lines.append(f"• {human_date}: {', '.join(slots)}")
 
         return "\n".join(lines)
+    def _is_technical_message(self, content: Any) -> bool:
+        """Определяет, является ли сообщение системным/техническим мусором."""
+        if not isinstance(content, str):
+            return False
+        
+        content_strip = content.strip()
+        # Список маркеров, которые мы не хотим показывать LLM
+        forbidden_markers = [
+            
+            "[Системное сообщение]"
+        ]
+        
+        return any(marker in content_strip for marker in forbidden_markers)
 
     def _validate_age_in_text(self, text: str, suggested_age: Any) -> bool:
         """Проверяет, соответствует ли извлеченный LLM возраст тому, что реально написал пользователь."""
@@ -228,14 +244,19 @@ class Engine:
         Техническая проверка даты (Аудит). Возвращает исправленную дату в формате YYYY-MM-DD.
         """
         # 1. Фильтруем системные команды и сопоставляем роли для понимания GPT-4o
+        # === ВНУТРИ _verify_date_audit ===
         clean_history_lines = []
         for m in history_messages:
             content = m.get('content', '')
-            # Пропускаем технические команды
+            
+            # Твоя новая фильтрация
+            if self._is_technical_message(content):
+                continue
+            
+            # Сохраняем старую фильтрацию системных команд
             if isinstance(content, str) and content.startswith('[SYSTEM COMMAND]'):
                 continue
             
-            # Определяем человекочитаемую роль
             role_label = "Кандидат" if m.get('role') == 'user' else "Бот"
             clean_history_lines.append(f"{role_label}: {content}")
 
@@ -909,8 +930,15 @@ class Engine:
             attempt_tracker = [] # Ловушка для попыток (tenacity)
 
             try:
-                # Берем историю для контекста (последние 25 сообщений)
-                history_for_llm = (dialogue.history or [])[-25:]
+                try:
+                raw_history = dialogue.history or []
+                # Фильтруем И мусор Авито, И системные команды бота
+                clean_history = [
+                    msg for msg in raw_history 
+                    if not self._is_technical_message(msg.get('content', '')) 
+                    and not str(msg.get('content', '')).startswith('[SYSTEM')
+                ]
+                history_for_llm = clean_history[-25:]
                 
                 # ВАЖНО: Добавлен аргумент current_datetime_utc, как в HH
                 llm_data = await get_bot_response(
@@ -1478,9 +1506,13 @@ class Engine:
                     # Подготовка истории (последние 20 сообщений)
                     clean_history_lines = []
                     for m in (dialogue.history or []):
-                        if not str(m.get('content', '')).startswith('[SYSTEM'):
+                        content = m.get('content', '')
+                        # Фильтруем мусор и системные команды
+                        if self._is_technical_message(content):
+                            continue
+                        if not str(content).startswith('[SYSTEM'):
                             role = "Кандидат" if m.get('role') == 'user' else "Бот"
-                            clean_history_lines.append(f"{role}: {m.get('content')}")
+                            clean_history_lines.append(f"{role}: {content}")
                     recent_history_text = "\n".join(clean_history_lines[-20:])
 
                     # Генерируем динамическую инструкцию по формату JSON
@@ -1569,12 +1601,17 @@ class Engine:
                 ctx_logger.info("Запуск финального аудита данных через Smart LLM...")
                 
                 # Собираем чистую историю без системных команд
+                # === ВНУТРИ блока финального аудита ===
                 all_msgs_for_verify = (dialogue.history or [])
                 verify_history_lines = []
                 for m in all_msgs_for_verify:
-                    if not str(m.get('content', '')).startswith('[SYSTEM'):
+                    content = m.get('content', '')
+                    # Фильтруем через твой метод + старый фильтр
+                    if self._is_technical_message(content):
+                        continue
+                    if not str(content).startswith('[SYSTEM'):
                         label = "Кандидат" if m.get('role') == 'user' else "Бот"
-                        verify_history_lines.append(f"{label}: {m.get('content')}")
+                        verify_history_lines.append(f"{label}: {content}")
                 
                 full_history_text = "\n".join(verify_history_lines)
 
@@ -1901,10 +1938,14 @@ class Engine:
                     ctx_logger.info("Проверка серьезности отказа кандидата через 'Судью'...")
                     
                     # 1. Сбор контекста (как в HH)
+                    # 1. Сбор контекста без мусора
                     all_msgs = (dialogue.history or [])
                     clean_history_with_roles = []
                     for m in all_msgs:
                         content = m.get('content', '')
+                        # Добавляем твою фильтрацию
+                        if self._is_technical_message(content):
+                            continue
                         if not str(content).startswith("[SYSTEM"):
                             role_label = "Кандидат" if m.get('role') == 'user' else "Бот"
                             clean_history_with_roles.append(f"{role_label}: {content}")
