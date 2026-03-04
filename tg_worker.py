@@ -12,7 +12,7 @@ from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from app.tg_bot.handlers import router as main_router
 from app.tg_bot.middlewares import DbSessionMiddleware
-
+import html  # Добавь в импорты наверху
 from app.core.config import settings
 from app.utils import tg_alerts
 from app.core.rabbitmq import mq
@@ -111,6 +111,8 @@ def format_history_txt(dialogue: Dialogue, candidate: Candidate, vacancy: JobCon
 
 
 
+import html  # Добавь в импорты наверху
+
 async def send_tg_notification(dialogue: Dialogue, candidate: Candidate, vacancy: JobContext, account: Account):
     """Логика формирования и отправки карточки в Telegram"""
     profile = candidate.profile_data or {}
@@ -122,29 +124,28 @@ async def send_tg_notification(dialogue: Dialogue, candidate: Candidate, vacancy
         logger.warning(f"Для аккаунта {account.name} не настроен tg_chat_id.")
         return
 
+    # НОВАЯ ФУНКЦИЯ ЭКРАНИРОВАНИЯ ДЛЯ HTML
     def esc(text):
-        if not text: return "—"
-        # Список символов, которые ОБЯЗАТЕЛЬНО нужно экранировать в MarkdownV2
-        chars = r"_*[]()~`>#+-=|{}.!"
-        res = str(text)
-        for c in chars:
-            res = res.replace(c, f"\\{c}")
-        return res
+        if text is None or text == "": return "—"
+        return html.escape(str(text))
     
     meta = dialogue.metadata_json or {}
+    # Ссылку в HTML экранировать не нужно внутри атрибута href, 
+    # но саму переменную на всякий случай прогоним через базовую проверку
     avito_link = f"https://www.avito.ru/profile/messenger/channel/{dialogue.external_chat_id}"
     
+    # ПЕРЕПИСЫВАЕМ ТЕКСТ ПОД HTML
     message_text = (
-        f"🚀 *Новый кандидат \(Авито\)*\n\n"
-        f"📌 *Вакансия:* {esc(vacancy.title if vacancy else 'Не указана')}\n"
-        f"👤 *ФИО:* {esc(candidate.full_name)}\n"
-        f"📞 *Телефон:* `{esc(candidate.phone_number)}`\n"
-        f"🎂 *Возраст:* {esc(profile.get('age'))}\n"
-        f"🌍 *Гражданство:* {esc(profile.get('citizenship'))}\n"
-        f"⏳ *Опыт (мес):* {esc(profile.get('experience'))}\n" # НОВОЕ
-        f"✅ *Готовность:* {esc(profile.get('readiness'))}\n\n" # НОВОЕ
-        f"📅 *Собеседование:* {esc(meta.get('interview_date'))} в {esc(meta.get('interview_time'))}\n\n"
-        f"🔗 [Открыть чат в Авито]({avito_link})"
+        f"🚀 <b>Новый кандидат (Авито)</b>\n\n"
+        f"📌 <b>Вакансия:</b> {esc(vacancy.title if vacancy else 'Не указана')}\n"
+        f"👤 <b>ФИО:</b> {esc(candidate.full_name)}\n"
+        f"📞 <b>Телефон:</b> <code>{esc(candidate.phone_number)}</code>\n"
+        f"🎂 <b>Возраст:</b> {esc(profile.get('age'))}\n"
+        f"🌍 <b>Гражданство:</b> {esc(profile.get('citizenship'))}\n"
+        f"⏳ <b>Опыт (мес):</b> {esc(profile.get('experience'))}\n"
+        f"✅ <b>Готовность:</b> {esc(profile.get('readiness'))}\n\n"
+        f"📅 <b>Собеседование:</b> {esc(meta.get('interview_date'))} в {esc(meta.get('interview_time'))}\n\n"
+        f"🔗 <a href='{avito_link}'>Открыть чат в Авито</a>"
     )
 
     history_text = format_history_txt(dialogue, candidate, vacancy)
@@ -157,11 +158,11 @@ async def send_tg_notification(dialogue: Dialogue, candidate: Candidate, vacancy
             document=document,
             caption=message_text,
             message_thread_id=target_topic_id,
-            parse_mode="MarkdownV2"
+            parse_mode="HTML"  # МЕНЯЕМ НА HTML
         )
-        logger.info(f"✅ Карточка по диалогу {dialogue.id} отправлена в TG")
+        logger.info(f"✅ Карточка по диалогу {dialogue.id} успешно отправлена в TG (HTML)")
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки в TG: {e}")
+        logger.error(f"❌ Ошибка отправки в TG (HTML): {e}")
 
 async def handle_reporting_task(message_body: dict):
     """Диспетчер задач отчетности (TG + Google Sheets)"""
