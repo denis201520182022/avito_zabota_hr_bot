@@ -7,7 +7,8 @@ from typing import List, Dict, Optional, Any
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
+import datetime  # <--- ДОБАВИТЬ ЭТО
+from datetime import datetime as dt_obj # Для удобства
 from app.core.config import settings
 from app.core.rabbitmq import mq 
 
@@ -27,6 +28,34 @@ class GoogleSheetsService:
         match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
         if match: return match.group(1)
         raise ValueError(f"Не удалось извлечь ID таблицы из ссылки: {url}")
+
+    def _date_to_ru_human(self, date_iso: str) -> str:
+        """Переводит '2026-03-02' -> 'понедельник, 2 марта'"""
+        try:
+            dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")
+            weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+            months = ["января", "февраля", "марта", "апреля", "мая", "июня", 
+                      "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+            return f"{weekdays[dt.weekday()]}, {dt.day} {months[dt.month-1]}"
+        except:
+            return date_iso
+
+    def _ru_human_to_iso(self, human_date: str) -> str:
+        """Переводит 'понедельник, 2 марта' -> '2026-03-02'"""
+        try:
+            # Предполагаем текущий год, так как в таблице его нет
+            year = datetime.datetime.now().year
+            months = ["января", "февраля", "марта", "апреля", "мая", "июня", 
+                      "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+            
+            # Убираем день недели: '2 марта'
+            parts = human_date.split(", ")[-1].split(" ")
+            day = int(parts[0])
+            month = months.index(parts[1]) + 1
+            return f"{year}-{month:02d}-{day:02d}"
+        except:
+            return human_date
+
 
     async def _send_critical_alert(self, error_text: str, payload: Optional[Dict] = None):
         """
@@ -88,10 +117,12 @@ class GoogleSheetsService:
 
     async def _update_slot_status(self, target_date: str, target_time: str, status: str, name: str) -> bool:
         context = {"date": target_date, "time": target_time, "status": status, "candidate": name}
+        
         try:
+            search_date = self._date_to_ru_human(target_date)
             rows = await self._get_all_calendar_rows()
             for idx, row in enumerate(rows):
-                if len(row) >= 2 and row[0].strip() == target_date and row[1].strip() == target_time:
+                if len(row) >= 2 and row[0].strip() == search_date and row[1].strip() == target_time:
                     row_number = idx + 2
                     service = await asyncio.to_thread(self._get_service)
                     
@@ -169,12 +200,13 @@ class GoogleSheetsService:
             )
 
     async def get_available_slots(self, target_date: str) -> List[str]:
+        search_date = self._date_to_ru_human(target_date)
         try:
             rows = await self._get_all_calendar_rows()
             available_times = []
             for row in rows:
                 if len(row) < 2: continue
-                if row[0].strip() == target_date:
+                if row[0].strip() == search_date:
                     # Слот свободен, если в C или D пусто
                     roman_free = len(row) <= 2 or not row[2].strip()
                     nastya_free = len(row) <= 4 or not row[4].strip()
@@ -191,14 +223,17 @@ class GoogleSheetsService:
             slots_map = {}
             for row in rows:
                 if len(row) < 2: continue
-                d, t = row[0].strip(), row[1].strip()
+                
+                # ПЕРЕВОДИМ ИЗ ТАБЛИЦЫ В ISO
+                d_iso = self._ru_human_to_iso(row[0].strip())
+                t = row[1].strip()
                 
                 roman_free = len(row) <= 2 or not row[2].strip()
                 nastya_free = len(row) <= 4 or not row[4].strip()
                 
                 if roman_free or nastya_free:
-                    if d not in slots_map: slots_map[d] = []
-                    slots_map[d].append(t)
+                    if d_iso not in slots_map: slots_map[d_iso] = []
+                    slots_map[d_iso].append(t)
             return slots_map
         except Exception:
             return {}

@@ -15,7 +15,7 @@ services:
       - DB_PORT=6432
       # Важно: переписываем полные URL, так как бот может использовать их
       - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@pgbouncer:6432/${DB_NAME}
-      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
       # Обрати внимание: порт Redis внутри сети - 6379 (6381 только снаружи)
       - REDIS_URL=redis://redis:6379/0
     # ---------------------------
@@ -42,8 +42,8 @@ services:
     #   - "5672:5672"
     #   - "15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: user
-      RABBITMQ_DEFAULT_PASS: password
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-password}
     volumes:
       - avito_rabbitmq_data:/var/lib/rabbitmq # Железное сохранение очередей
     networks:
