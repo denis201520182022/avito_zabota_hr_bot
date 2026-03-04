@@ -930,7 +930,7 @@ class Engine:
             attempt_tracker = [] # Ловушка для попыток (tenacity)
 
             try:
-                try:
+                
                 raw_history = dialogue.history or []
                 # Фильтруем И мусор Авито, И системные команды бота
                 clean_history = [
