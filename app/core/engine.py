@@ -1095,7 +1095,7 @@ class Engine:
                         calendar_ctx = self._generate_calendar_context_2() 
                         
                         verified_date, audit_reason = await self._verify_date_audit(db, dialogue, interview_date, full_hist, calendar_ctx, ctx_logger.extra) 
-                        ctx_logger.info(verified_date, ' ОБЪЯСНЕНИЕ МОДЕЛИ ', audit_reason)
+                        ctx_logger.info(f"{verified_date} ОБЪЯСНЕНИЕ МОДЕЛИ {audit_reason}")
                         # Если аудитор не согласен
                         if verified_date != interview_date and verified_date != "none":
                             ctx_logger.warning(f"🚨 ГАЛЛЮЦИНАЦИЯ ДАТЫ! LLM: {interview_date}, Аудитор: {verified_date}")
