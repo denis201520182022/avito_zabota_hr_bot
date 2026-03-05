@@ -22,7 +22,7 @@ class AvitoConnectorService:
     def __init__(self):
         self.is_running = False
         self._poll_task: Optional[asyncio.Task] = None
-        self.poll_interval = 5
+        self.poll_interval = 60
 
     async def start(self):
         if self.is_running:
@@ -309,7 +309,7 @@ class AvitoConnectorService:
             if dialogue:
                 # --- ДОБАВЬ ЭТОТ БЛОК ---
                 if source == "avito_poller":
-                    logger.info(f"♻️ Поллинг прислал существующий чат {external_chat_id}. Игнорируем (уже обработан).")
+                    logger.debug(f"♻️ Поллинг прислал существующий чат {external_chat_id}. Игнорируем (уже обработан).")
                     return # Сразу выходим, не обновляя историю и не отправляя в Engine
                 
                 # --- ЛОГИКА ДЛЯ СУЩЕСТВУЮЩЕГО ДИАЛОГА ---
