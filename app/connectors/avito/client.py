@@ -1,463 +1,697 @@
-# app/connectors/avito/client.py
-import logging
-import httpx
-import datetime
+# app/connectors/avito/service.py
 import asyncio
-from typing import List, Dict, Any, Optional
-from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import logging
 import os
-from app.utils.redis_lock import acquire_lock, release_lock, DistributedSemaphore 
-from app.db.models import Account
+import datetime
+from typing import Optional, Any, Dict
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from app.db.session import AsyncSessionLocal
+from app.db.models import Account, JobContext, Candidate, Dialogue, AppSettings, AnalyticsEvent
 from app.core.rabbitmq import mq
-from app.utils.redis_lock import acquire_lock, release_lock
 from app.utils.redis_lock import get_redis_client
 
-logger = logging.getLogger("avito.client")
-AVITO_CONCURRENCY_LIMIT = int(os.getenv("AVITO_CONCURRENCY_LIMIT", 5))
-class AvitoClient:
+from .client import avito
+
+logger = logging.getLogger("avito.service")
+
+class AvitoConnectorService:
     def __init__(self):
-        self.base_url = "https://api.avito.ru"
-        self.token_url = f"{self.base_url}/token"
-        self._http_client: Optional[httpx.AsyncClient] = None
+        self.is_running = False
+        self._poll_task: Optional[asyncio.Task] = None
+        self.poll_interval = 5
 
-    @property
-    def http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=30.0)
-        return self._http_client
+    async def start(self):
+        if self.is_running:
+            return
+        self.is_running = True
+        logger.info("🚀 Запуск Avito Connector Service...")
+        await self._setup_all_webhooks()
+        self._poll_task = asyncio.create_task(self._poll_loop())
 
-    async def close(self):
-        if self._http_client and not self._http_client.is_closed:
-            await self._http_client.aclose()
-    
-    async def _send_alert(self, text: str):
-        try: await mq.publish("tg_alerts", {"type": "system", "text": text})
-        except: logger.error("Не удалось отправить алерт")
+    async def stop(self):
+        logger.info("🛑 Остановка Avito Connector Service...")
+        self.is_running = False
+        if self._poll_task:
+            self._poll_task.cancel()
+            try: await self._poll_task
+            except asyncio.CancelledError: pass
+        await avito.close()
+        logger.info("✅ Avito Connector Service полностью остановлен.")
 
-    # --- АВТОРИЗАЦИЯ С БЛОКИРОВКОЙ ---
-    
-    async def get_token(self, account: Account, db: AsyncSession) -> str:
-        auth_data = account.auth_data or {}
-        now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        
-        if auth_data.get("access_token") and auth_data.get("expires_at", 0) > (now_ts + 300):
-            return auth_data["access_token"]
-        
-        lock_key = f"token_lock:{account.id}"
-        if not await acquire_lock(lock_key, timeout=20):
-            logger.info(f"⏳ Обновление токена для {account.id} уже в процессе. Ожидание...")
-            await asyncio.sleep(3)
-            await db.refresh(account)
-            return await self.get_token(account, db)
+    async def _setup_all_webhooks(self):
+        webhook_base = os.getenv("WEBHOOK_BASE_URL")
+        if not webhook_base:
+            error_msg = "❌ WEBHOOK_BASE_URL не задан! Бот не будет получать сообщения из чатов."
+            logger.error(error_msg)
+            await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
+            return
 
+        target_url = webhook_base.rstrip('/') + "/webhooks/avito"
+        async with AsyncSessionLocal() as db:
+            try:
+                stmt = select(Account).filter_by(platform="avito", is_active=True)
+                accounts = (await db.execute(stmt)).scalars().all()
+                logger.info(f"🔍 [Webhooks] Найдено {len(accounts)} активных аккаунтов в БД.")
+                for acc in accounts:
+                    await avito.check_and_register_webhooks(acc, db, target_url)
+            except Exception as e:
+                error_msg = f"❌ Ошибка инициализации вебхуков Avito: {e}"
+                logger.error(error_msg, exc_info=True)
+                await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
+
+    async def _poll_loop(self):
+        while self.is_running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    stmt = select(Account).filter_by(platform="avito", is_active=True)
+                    accounts = (await db.execute(stmt)).scalars().all()
+                    if accounts:
+                        logger.info(f"🕒 [Polling] Опрашиваю {len(accounts)} аккаунтов на наличие новых откликов...")
+                    else:
+                        logger.warning("⚠️ [Polling] В базе 0 активных аккаунтов Avito. Некого опрашивать.")
+                    tasks = [self._poll_single_account(acc, db) for acc in accounts]
+                    await asyncio.gather(*tasks)
+            except Exception as e:
+                error_msg = f"💥 Критическая ошибка в цикле поллинга откликов: {e}"
+                logger.error(error_msg, exc_info=True)
+                await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
+            await asyncio.sleep(self.poll_interval)
+
+    async def _poll_single_account(self, account: Account, db: AsyncSession):
         try:
-            logger.info(f"🔑 Обновление токена для аккаунта {account.name} (ID: {account.id})")
-            
-            client_id = auth_data.get("client_id")
-            client_secret = auth_data.get("client_secret")
-            if not client_id or not client_secret:
-                raise ValueError("В базе данных не найдены credentials (ID/Secret)")
+            new_apps = await avito.get_new_applications(account, db)
+            if new_apps:
+                logger.info(f"✅ Аккаунт {account.name}: Найдено {len(new_apps)} новых откликов!")
+            else:
+                logger.debug(f"🔎 Аккаунт {account.name}: Новых откликов нет.")
+            for app_data in new_apps:
+                await self.process_avito_event({
+                    "source": "avito_poller",
+                    "account_id": account.id,
+                    "payload": app_data
+                })
+        except Exception as e:
+            error_msg = f"⚠️ Ошибка поллинга аккаунта {account.name} (ID: {account.id}): {e}"
+            logger.error(error_msg, exc_info=True)
+            await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
 
-            payload = {
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret
+    # --- ЛОГИКА УНИФИКАТОРА ---
+
+    def _parse_message_content(self, content_data: dict) -> str:
+        """Единая логика извлечения текста из сложной структуры Авито"""
+        text_content = content_data.get("text")
+        
+        if not text_content:
+            if content_data.get("image"):
+                text_content = "[Вложение: Изображение]"
+            elif content_data.get("item"):
+                item_title = content_data.get("item", {}).get("title", "Товар")
+                text_content = f"[Вложение: Карточка товара - {item_title}]"
+            elif content_data.get("link"):
+                # Исправили кавычки тут
+                url = content_data.get("link", {}).get("url", "нет ссылки")
+                text_content = f"[Вложение: Ссылка - {url}]"
+            elif content_data.get("call"):
+                status = content_data.get("call", {}).get("status", "")
+                text_content = f"[Звонок: {status}]"
+            else:
+                text_content = "[Неподдерживаемый тип сообщения]"
+        return text_content
+
+    def _inject_webhook_message(self, dialogue: Dialogue, payload: dict, account: Account):
+        """
+        Ручное добавление сообщения из вебхука в историю перед синхронизацией.
+        """
+        try:
+            # Путь к данным в вебхуке Messenger V3: payload -> value
+            msg_data = payload.get("payload", {}).get("value", {})
+            if not msg_data:
+                return
+
+            msg_id = str(msg_data.get("id"))
+            
+            # Проверка на дубликаты (вдруг уже есть)
+            existing_ids = {str(m.get("message_id")) for m in (dialogue.history or [])}
+            if msg_id in existing_ids:
+                return
+
+            # Определение роли
+            author_id = str(msg_data.get("author_id"))
+            # Наш ID (бота). Берем из базы.
+            my_user_id = str(account.auth_data.get("user_id"))
+            
+            # Если автор - это мы, то роль assistant, иначе user
+            role = "assistant" if author_id == my_user_id else "user"
+
+            # Время: в вебхуке оно в Unix timestamp (created)
+            created_ts = msg_data.get("created")
+            timestamp_utc = datetime.datetime.fromtimestamp(created_ts, datetime.timezone.utc).isoformat()
+
+            # Контент: используем наш общий парсер
+            content_text = self._parse_message_content(msg_data.get("content", {}))
+            # --- ДОБАВИТЬ ЭТУ ПРОВЕРКУ ---
+            if content_text.strip().startswith("[Системное сообщение]"):
+                logger.info(f"🚫 Игнорируем системное сообщение из вебхука в чате {dialogue.external_chat_id}")
+                return # Просто выходим, не добавляя в историю
+            
+            new_entry = {
+                "role": role,
+                "content": content_text,
+                "message_id": msg_id,
+                "timestamp_utc": timestamp_utc
             }
             
-            resp = await self.http_client.post(self.token_url, data=payload)
-            resp.raise_for_status()
-            token_data = resp.json()
+            # Если это исходящее от нас, добавляем контекст
+            if role == "assistant":
+                new_entry["state"] = dialogue.current_state
+                new_entry["extracted_data"] = {}
 
-            new_auth = dict(auth_data)
-            new_auth.update({
-                "access_token": token_data["access_token"],
-                "expires_at": now_ts + token_data["expires_in"]
-            })
+            # Добавляем в историю
+            history = list(dialogue.history or [])
+            history.append(new_entry)
             
-            account.auth_data = new_auth
-            await db.commit()
+            # Сортируем на всякий случай, чтобы порядок был верным
+            history.sort(key=lambda x: x.get("timestamp_utc") or "0000-01-01T00:00:00+00:00")
             
-            logger.info(f"✅ Токен успешно получен для аккаунта {account.id}")
-            return token_data["access_token"]
+            dialogue.history = history
+            dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
+            
+            logger.info(f"⚡ Сообщение {msg_id} добавлено из вебхука мгновенно.")
+
         except Exception as e:
-            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА АВТОРИЗАЦИИ Avito для аккаунта {account.name}: {e}"
-            logger.error(error_msg, exc_info=True)
-            await self._send_alert(error_msg)
-            raise
-        finally:
-            await release_lock(lock_key)
+            logger.error(f"⚠️ Ошибка при ручном добавлении вебхука в историю: {e}")
+            # Не падаем, так как следом пойдет _update_history_only и починит всё
 
-    # --- УНИВЕРСАЛЬНЫЙ ЗАПРОС С РЕТРАЯМИ ---
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=1, max=10),
-        retry=retry_if_exception_type(httpx.HTTPError),
-        reraise=True
-    )
-    async def _request(self, method: str, path: str, account: Account, db: AsyncSession, **kwargs) -> Any:
-        url = f"{self.base_url}{path}"
-        token = await self.get_token(account, db)
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {token}"
-        
-        try:
-            # === НАЧАЛО ИЗМЕНЕНИЙ ===
-            # Ограничиваем количество одновременных запросов ко всему API Avito
-            async with DistributedSemaphore(name="avito_api_global", limit=AVITO_CONCURRENCY_LIMIT):
-                resp = await self.http_client.request(method, url, headers=headers, **kwargs)
-            # === КОНЕЦ ИЗМЕНЕНИЙ ===
-            
-            
-            if resp.status_code == 401:
-                logger.warning(f"⚠️ 401 Unauthorized для {account.id}. Сброс токена и повтор...")
-                auth = dict(account.auth_data)
-                auth["expires_at"] = 0
-                account.auth_data = auth
-                await db.commit()
-                
-                token = await self.get_token(account, db)
-                headers["Authorization"] = f"Bearer {token}"
-                async with DistributedSemaphore(name="avito_api_global", limit=AVITO_CONCURRENCY_LIMIT):
-                    resp = await self.http_client.request(method, url, headers=headers, **kwargs)
-
-            resp.raise_for_status()
-            return resp.json()
-            
-        except httpx.HTTPStatusError as e:
-            error_msg = f"❌ API Error {e.response.status_code} на {url}: {e.response.text}"
-            logger.error(error_msg)
-            # Если это последняя попытка ретрая, шлем алерт
-            if getattr(e.request, 'extensions', {}).get('retry_attempt') == 3:
-                await self._send_alert(error_msg)
-            raise
-
-    # --- ВЕБХУКИ (MESSENGER API V3) ---
-
-    async def check_and_register_webhooks(self, account: Account, db: AsyncSession, target_url: str):
-        if not account.auth_data.get("user_id"):
-            try:
-                me = await self._request("GET", "/core/v1/accounts/self", account, db)
-                auth = dict(account.auth_data)
-                auth["user_id"] = str(me["id"])
-                account.auth_data = auth
-                await db.commit()
-                logger.info(f"👤 Получен UserID для аккаунта {account.id}: {me['id']}")
-            except Exception as e:
-                logger.error(f"Не удалось получить self info для {account.id}: {e}")
-
-        try:
-            subs_data = await self._request("POST", "/messenger/v1/subscriptions", account, db)
-            subscriptions = subs_data.get("subscriptions", [])
-            
-            is_active = any(s.get("url") == target_url for s in subscriptions)
-            
-            if not is_active:
-                logger.info(f"🔌 Регистрация Messenger Webhook для {account.id} -> {target_url}")
-                await self._request(
-                    "POST", "/messenger/v3/webhook", account, db, json={"url": target_url}
-                )
-                logger.info(f"✅ Вебхук успешно привязан")
-            else:
-                logger.debug(f"👌 Вебхук для аккаунта {account.id} уже настроен")
-        except Exception as e:
-            error_msg = f"❌ Ошибка регистрации вебхука для {account.name}: {e}"
-            logger.error(error_msg)
-            await self._send_alert(error_msg)
-
-    # --- ПОЛЛИНГ ОТКЛИКОВ (JOB API V1) ---
-
-    async def get_new_applications(self, account: Account, db: AsyncSession) -> List[Dict]:
+    async def _accumulate_and_dispatch(self, dialogue: Dialogue, job: JobContext, source: str):
         redis = get_redis_client()
-        cursor_key = f"avito_cursor:{account.id}"
+        lock_key = f"debounce_lock:{dialogue.external_chat_id}"
         
-        # 1. Пытаемся взять курсор из Redis
-        cursor = await redis.get(cursor_key)
+        if await redis.get(lock_key):
+            logger.info(f"⏳ Сообщение для чата {dialogue.external_chat_id} добавлено в очередь ожидания.")
+            return
+
+        await redis.set(lock_key, "1", ex=6)
+
+        async def wait_and_push():
+            try:
+                await asyncio.sleep(5)
+                
+                engine_task = {
+                    "dialogue_id": dialogue.id,
+                    "account_id": dialogue.account_id,
+                    "candidate_id": dialogue.candidate_id,
+                    "vacancy_id": job.id if job else None,
+                    "platform": "avito",
+                    "trigger": source
+                }
+                
+                await mq.publish("engine_tasks", engine_task)
+                # ЛОГ ПЕРЕНЕСЕН СЮДА:
+                logger.info(f"🚀 [Debounce] Пачка сообщений для диалога {dialogue.id} отправлена в Engine")
+                
+            except Exception as e:
+                error_msg = f"💥 Ошибка в фоновом накопителе Debounce: {e}"
+                logger.error(error_msg, exc_info=True)
+                await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
+                raise e
+            finally:
+                await redis.delete(lock_key)
+
+        asyncio.create_task(wait_and_push())
+
+    async def process_avito_event(self, raw_data: dict):
+        source = raw_data.get("source")
+        payload = raw_data.get("payload", {})
         
-        # Точка отсчета — 24 часа назад (в формате ISO или как требует API)
-        # Для updatedAtFrom Авито обычно ждет YYYY-MM-DD
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        yesterday_str = (now_utc - datetime.timedelta(hours=24)).strftime("%Y-%m-%d")
+        avito_user_id = raw_data.get("avito_user_id") 
+        account_id = raw_data.get("account_id")      
         
+
+        external_chat_id = None
+        resume_id = None
+        item_id = None
+        avito_author_id = None 
+        is_system_msg = False
+
+        # 1. Извлекаем данные в зависимости от источника
+        if source == "avito_webhook":
+            msg_val = payload.get("payload", {}).get("value", {})
+            external_chat_id = msg_val.get("chat_id")
+            item_id = msg_val.get("item_id")
+            avito_author_id = str(msg_val.get("author_id")) if msg_val.get("author_id") else None
+            
+            # Проверка на системное сообщение
+            text = msg_val.get("content", {}).get("text", "")
+            if text.strip().startswith("[Системное сообщение]"):
+                is_system_msg = True
+
+            
+                
+
+            # Игнорируем эхо (сообщения бота)
+            if avito_author_id and str(avito_author_id) == str(avito_user_id):
+                logger.info(f"🚫 Игнорируем эхо-сообщение от бота в чате {external_chat_id}")
+                return 
+
+        elif source == "avito_poller":
+            contacts = payload.get("contacts", {})
+            external_chat_id = contacts.get("chat", {}).get("value")
+            resume_id = str(payload.get("applicant", {}).get("resume_id"))
+            item_id = payload.get("vacancy_id")
+            avito_author_id = str(payload.get("applicant", {}).get("user_id"))
+            
+                
+
+        elif source == "avito_search_found":
+            external_chat_id = raw_data.get("chat_id")
+            resume_id = raw_data.get("resume_id")
+            item_id = raw_data.get("vacancy_id")
+            # Для поиска автор - это ID кандидата, переданный извне
+            avito_author_id = str(raw_data.get("avito_user_id_candidate")) 
+            
+
+        async with AsyncSessionLocal() as db:
+            # 2. Находим аккаунт владельца
+            if source == "avito_webhook":
+                account = await db.scalar(select(Account).filter(Account.auth_data['user_id'].astext == str(avito_user_id)))
+            else:
+                account = await db.get(Account, account_id)
+
+            if not account:
+                logger.error(f"❌ Аккаунт не найден (ID: {avito_user_id})")
+                return
+
+            # 3. Ищем существующий диалог
+            stmt = select(Dialogue).options(selectinload(Dialogue.vacancy)).filter_by(external_chat_id=external_chat_id)
+            dialogue = (await db.execute(stmt)).scalar_one_or_none()
+
+            if dialogue:
+                # --- ЛОГИКА ДЛЯ СУЩЕСТВУЮЩЕГО ДИАЛОГА ---
+                if is_system_msg:
+                    logger.info(f"🚫 Игнорируем системное сообщение в СУЩЕСТВУЮЩЕМ чате {external_chat_id}")
+                    return 
+                
+                
+
+                # Обновляем историю нормальным сообщением
+                if source == "avito_webhook":
+                    self._inject_webhook_message(dialogue, payload, account)
+                await self._update_history_only(dialogue, account, external_chat_id, db)
+
+            else:
+                # --- ЛОГИКА ДЛЯ НОВОГО ДИАЛОГА ---
+                if is_system_msg:
+                    logger.info(f"🆕 Системное сообщение в НОВОМ чате {external_chat_id}. Инициализируем диалог.")
+
+                # Определяем идентификатор кандидата (resume_id в приоритете)
+                # 1. Сначала пытаемся найти resume_id (для вакансий)
+                if not resume_id:
+                    try:
+                        resume_id = await self._fetch_resume_id_by_chat_id(account, db, external_chat_id)
+                    except Exception:
+                        resume_id = None
+
+                # 2. Формируем БАЗОВЫЙ ID (либо резюме, либо автор, либо заглушка)
+                base_id = resume_id or (avito_author_id if avito_author_id and avito_author_id != "1" else f"temp_{external_chat_id[-8:]}")
+                
+                # 3. ФОРМИРУЕМ УНИКАЛЬНЫЙ СОСТАВНОЙ КЛЮЧ: ЮЗЕР + ВАКАНСИЯ
+                # Теперь platform_user_id будет выглядеть так: "12345_67890"
+                unique_candidate_key = f"{base_id}_{item_id}"
+
+                # 4. Ищем или создаем кандидата по этому составному ключу
+                candidate = await db.scalar(select(Candidate).filter_by(platform_user_id=unique_candidate_key))
+                if not candidate:
+                    try:
+                        async with db.begin_nested():
+                            candidate = Candidate(
+                                platform_user_id=unique_candidate_key, 
+                                profile_data={"note": f"Unique candidate for context {item_id}"}
+                            )
+                            db.add(candidate)
+                            await db.flush()
+                    except Exception:
+                        await db.rollback()
+                        candidate = await db.scalar(select(Candidate).filter_by(platform_user_id=unique_candidate_key))
+
+                # 5. Синхронизируем вакансию
+                job_context = None
+                if item_id:
+                    try:
+                        job_context = await self._sync_vacancy(account, db, item_id)
+                    except:
+                        logger.info(f"ℹ️ Контекст объявления {item_id} не подтянут, продолжаем.")
+
+                # 6. Биллинг и создание диалога
+                dialogue = await self._sync_dialogue_and_billing(
+                    account, candidate, job_context, external_chat_id, db, 
+                    payload if source == "avito_poller" else {},
+                    trigger_source=source
+                )
+
+            # 7. Отправка в Engine (если чат не закрыт)
+            if dialogue:
+                if dialogue.status == 'rejected':
+                    logger.info(f"🤐 Чат {external_chat_id} отклонен. Молчим.")
+                else:
+                    # Даже если это было системное сообщение, Engine проверит историю и отправит приветствие
+                    await self._accumulate_and_dispatch(dialogue, dialogue.vacancy, source)
+            
+            await db.commit()
+
+    def _enrich_from_resume(self, candidate: Candidate, resume: dict):
+        """
+        Парсит данные из Resume API и записывает их в profile_data кандидата.
+        """
+        profile = dict(candidate.profile_data or {})
+        params = resume.get("params", {})
+        addr = resume.get("address_details", {})
+
+        # 1. Город проживания
+        if not profile.get("city"):
+            profile["city"] = addr.get("location") or params.get("address")
+
+        # 2. Возраст
+        if not profile.get("age"):
+            profile["age"] = params.get("age")
+
+        # 3. Гражданство
+        if not profile.get("citizenship"):
+            profile["citizenship"] = params.get("nationality")
+
+        # 4. Наличие патента (Разрешение на работу в РФ)
+        if "has_patent" not in profile:
+            val = params.get("razreshenie_na_rabotu_v_rossii")
+            if val == "Да":
+                profile["has_patent"] = "да"
+            elif val == "Нет":
+                profile["has_patent"] = "нет"
+
+        candidate.profile_data = profile
+
+
+
+    async def _fetch_resume_id_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str) -> str:
+        """
+        Метод-мост: находит resume_id через Job API, используя фильтр chatId.
+        Теперь с обязательным параметром updatedAtFrom.
+        """
+        # Определяем дату, начиная с которой искать (например, за последние 30 дней)
+        # Этого достаточно, чтобы найти активный отклик.
+        date_from = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+
         params = {
-            "limit": 100
+            "chatId": chat_id,
+            "updatedAtFrom": date_from  # <--- ТЕПЕРЬ ОБЯЗАТЕЛЬНО
         }
 
-        # Если курсора нет — берем за последние сутки
-        if cursor:
-            params["cursor"] = cursor
-        else:
-            params["updatedAtFrom"] = yesterday_str
-
-        try:
-            # 2. Получаем список ID (используем ключ 'applies' из доки)
-            resp_ids = await self._request("GET", "/job/v1/applications/get_ids", account, db, params=params)
-            
-            app_list = resp_ids.get("applies", []) # Исправлено с 'applications' на 'applies'
-            if not app_list:
-                return []
-
-            # 3. Собираем только те ID, которые не старше 24 часов (на случай, если API вернуло лишнее)
-            # Примечание: В ответе get_ids обычно нет даты, только ID. 
-            # Поэтому фильтрацию по времени лучше сделать после получения деталей.
-            application_ids = [str(item["id"]) for item in app_list]
-
-            # 4. Получаем детали откликов
-            details_resp = await self._request(
-                "POST", "/job/v1/applications/get_by_ids", account, db, json={"ids": application_ids}
-            )
-            
-            full_applications = details_resp.get("applications", [])
-
-            # 5. Фильтруем результат строго по времени (updated_at >= now - 24h)
-            # Авито возвращает timestamps в секундах или ISO строки в зависимости от версии
-            cutoff_timestamp = (now_utc - datetime.timedelta(hours=24)).timestamp()
-            
-            filtered_apps = []
-            for app in full_applications:
-                # В Job API обычно поле updatedAt в секундах
-                app_updated = app.get("updated_at", 0)
-                if app_updated >= cutoff_timestamp:
-                    filtered_apps.append(app)
-
-            # 6. Сохраняем новый курсор в Redis (ставим TTL 2 дня, чтобы не копились вечно)
-            new_cursor = resp_ids.get("cursor")
-            if new_cursor:
-                await redis.set(cursor_key, new_cursor, ex=172800) # 48 часов
-
-            return filtered_apps
-
-        except Exception as e:
-            error_msg = f"❌ Ошибка полинга откликов (Account {account.id}): {e}"
-            logger.error(error_msg)
-            # Важно: не бросаем исключение выше, чтобы один упавший аккаунт не вешал весь цикл
-            return []
-
-    # --- ОТПРАВКА СООБЩЕНИЙ (MESSENGER API V1) ---
-
-    async def send_message(self, account: Account, db: AsyncSession, chat_id: str, text: str, user_id: str = "me"):
-        # Если в базе нет user_id, используем "me"
-        avito_user_id = account.auth_data.get("user_id", user_id)
-        path = f"/messenger/v1/accounts/{avito_user_id}/chats/{chat_id}/messages"
-        payload = {"message": {"text": text}, "type": "text"}
-        return await self._request("POST", path, account, db, json=payload)
-
-    async def get_vacancy_details(self, account: Account, db: AsyncSession, vacancy_id: int) -> Dict:
-        path = f"/job/v2/vacancies/{vacancy_id}"
-        params = {"fields": "title,description,addressDetails"}
-        return await self._request("GET", path, account, db, params=params)
-
-    async def get_chat_context(self, account: Account, db: AsyncSession, chat_id: str) -> Dict:
-        user_id = account.auth_data.get("user_id")
-        path = f"/messenger/v2/accounts/{user_id}/chats/{chat_id}"
-        return await self._request("GET", path, account, db)
-    
-    async def get_chat_messages(self, user_id: str, chat_id: str, account: Account, db: AsyncSession, limit: int = 20):
-        path = f"/messenger/v3/accounts/{user_id}/chats/{chat_id}/messages"
-        data = await self._request("GET", path, account, db, params={"limit": limit})
-        return data.get("messages", [])
-
-    async def get_job_details(self, vacancy_id: str, account: Account, db: AsyncSession):
-        # Используем правильный путь с ID вакансии в строке
-        path = f"/job/v2/vacancies/{vacancy_id}"
-        
-        # Делаем GET запрос. По документации, если не передавать fields/params, 
-        # API вернет все доступные поля по умолчанию.
-        data = await self._request("GET", path, account, db)
-        
-        if not data:
-            raise ValueError(f"Vacancy {vacancy_id} not found")
-            
-        # В этом методе ответ — это сразу объект вакансии (не список)
-        vac = data
-        
-        # Формируем полный текст для базы данных
-        full_description_text = self._format_vacancy_full_text(vac)
-
-        from dataclasses import dataclass
-        @dataclass
-        class VacDTO:
-            title: str
-            description: str
-            city: str
-            raw_json: dict
-
-        return VacDTO(
-            title=vac.get("title", "Без названия"),
-            description=full_description_text,
-            city=vac.get("addressDetails", {}).get("city", "Не указан"),
-            raw_json=vac 
+        # 1. Получаем ID отклика по chatId
+        logger.info(f"🔍 Запрос в Job API для поиска отклика по chatId: {chat_id}")
+        resp_ids = await avito._request(
+            "GET", 
+            "/job/v1/applications/get_ids", 
+            account, 
+            db, 
+            params=params
         )
-
-    def _format_vacancy_full_text(self, vac: dict) -> str:
-        lines = []
         
-        # Заголовок и ссылка
-        lines.append(f"📋 ВАКАНСИЯ: {vac.get('title', 'Не указано')}")
-        if vac.get('url'):
-            lines.append(f"🔗 Ссылка: https://www.avito.ru{vac.get('url')}")
-        lines.append("")
-
-        # Зарплата (может быть числом или объектом)
-        salary = vac.get('salary')
-        if isinstance(salary, dict):
-            lines.append(f"💰 Зарплата: от {salary.get('from')} до {salary.get('to')} руб.")
-        elif salary:
-            lines.append(f"💰 Зарплата: {salary} руб.")
+        apps = resp_ids.get("applications", [])
         
-        # Локация и координаты
-        addr = vac.get('addressDetails', {})
-        if addr:
-            lines.append(f"📍 Локация: {addr.get('province', '')}, {addr.get('city', '')}, {addr.get('address', '')}")
-            coords = addr.get('coordinates', {})
-            if coords:
-                lines.append(f"🌐 Координаты: {coords.get('latitude')}, {coords.get('longitude')}")
-        lines.append("")
+        if not apps:
+            raise ValueError(f"Отклик для чата {chat_id} не найден в Job API (искали с {date_from})")
 
-        # Условия из блока params
-        params = vac.get('params', {})
-        if params:
-            lines.append("🏗 ДЕТАЛИ И УСЛОВИЯ:")
-            mapping = {
-                "schedule": "График",
-                "experience": "Опыт",
-                "employment": "Занятость",
-                "payout_frequency": "Частота выплат", # Добавили
-                "paid_period": "Период оплаты",
-                "registration_method": "Оформление",
-                "medical_book": "Медкнижка",
-                "is_company_car": "Авто компании",
-                "is_remote": "Удаленка",
-                "is_side_job": "Подработка",
-                "taxes": "Налоги",
-                "tools_availability": "Инструменты",
-                "worker_class": "Разряд/Класс", # Добавили
-                "work_format": "Формат",
-                "shifts": "Смены",
-                "salary_base_bonus": "Бонусы/Премии",
-                "salary_base_range": "Диапазон оклада", # Добавили
-                "age_preferences": "Предпочтения по возрасту",
-                "profession": "Профессия", # Добавили
-                "vehicle_type": "Тип транспорта", # Добавили
-                "work_days_per_week": "Дней в неделю", # Добавили
-                "work_hours_per_day": "Часов в день", # Добавили
-                "retail_equipment_type": "Торговое оборудование", # Добавили
-                "retail_shop_type": "Тип магазина", # Добавили
-                "vacancy_code": "Код вакансии" # Добавили
-            }
-
-            for key, label in mapping.items():
-                val = params.get(key)
-                if val:
-                    if isinstance(val, list): val = ", ".join(map(str, val))
-                    elif isinstance(val, dict): val = f"от {val.get('from')} до {val.get('to')}"
-                    lines.append(f"  • {label}: {val}")
-            lines.append("")
-
-        # Описание
-        lines.append("📝 ПОЛНОЕ ОПИСАНИЕ:")
-        lines.append(vac.get('description', 'Описание отсутствует'))
+        app_id = apps[0]["id"]
+        logger.info(f"✅ Найден ID отклика: {app_id}, запрашиваем детали...")
         
-        return "\n".join(lines)
-    
-    async def search_resumes(self, account: Account, db: AsyncSession, params: dict) -> dict:
-        """
-        Поиск резюме по параметрам (GET /job/v1/resumes/)
-        """
-        path = "/job/v1/resumes/"
-        return await self._request("GET", path, account, db, params=params)
+        # 2. Получаем детали отклика, чтобы вытащить resume_id
+        details = await avito._request(
+            "POST", 
+            "/job/v1/applications/get_by_ids", 
+            account, 
+            db, 
+            json={"ids": [app_id]}
+        )
         
-        return await self._request("GET", path, account, db, params=params)
-    async def get_resume_details(self, account: Account, db: AsyncSession, resume_id: str) -> Dict:
-        """
-        Запрос к /job/v2/resumes/{resume_id}
-        """
-        path = f"/job/v2/resumes/{resume_id}"
-        # Запрашиваем все поля для максимального профиля
-        return await self._request("GET", path, account, db)
-    async def search_cvs(self, account: Account, db: AsyncSession, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Поиск резюме по параметрам"""
-        path = "/job/v1/resumes/"
-        return await self._request("GET", path, account, db, params=params)
+        app_details = details.get("applies", [])
+        
+        if not app_details:
+            raise ValueError(f"Не удалось получить детали отклика {app_id}")
 
-    async def get_resume_contacts(self, account: Account, db: AsyncSession, resume_id: str) -> Dict[str, Any]:
-        """Получение контактов резюме, включая chat_id"""
-        path = f"/job/v1/resumes/{resume_id}/contacts/"
-        return await self._request("GET", path, account, db)
-    
-    async def delete_message(self, account: Account, db: AsyncSession, chat_id: str, message_id: str):
-        """
-        Удаляет сообщение в чате Авито. 
-        Внимание: удалять можно только свои сообщения и не позднее 1 часа с момента отправки.
-        """
-        user_id = account.auth_data.get("user_id")
-        path = f"/messenger/v1/accounts/{user_id}/chats/{chat_id}/messages/{message_id}"
+        resume_id = str(app_details[0].get("applicant", {}).get("resume_id"))
+        logger.info(f"✅ Получен resume_id: {resume_id}")
         
-        try:
-            # Метод POST, тело пустое
-            return await self._request("POST", path, account, db, json={})
-        except Exception as e:
-            # Не бросаем ошибку, так как сообщения старше часа просто не удалятся
-            logger.warning(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
+        return resume_id
+
+    async def _sync_vacancy(self, account: Account, db: AsyncSession, item_id: Any) -> Optional[JobContext]:
+        if not item_id:
             return None
         
-    # --- ДОБАВИТЬ В AvitoClient ---
+        try:
+            vac_details = None
+            
+            # 1. Пробуем как вакансию
+            try:
+                vac_details = await avito.get_job_details(str(item_id), account, db)
+            except Exception:
+                # 2. Если не вакансия — тянем через наш новый get_item_details
+                logger.info(f"ℹ️ {item_id} не вакансия. Тянем базовые данные через Core API...")
+                vac_details = await avito.get_item_details(str(item_id), account, db)
+
+            # 3. Сохраняем в базу (название и город уже будут)
+            job = await db.scalar(select(JobContext).filter_by(external_id=str(item_id)))
+            if not job:
+                job = JobContext(external_id=str(item_id), account_id=account.id)
+                db.add(job)
+            
+            job.title = vac_details.title
+            job.city = vac_details.city
+            # Сюда запишется наша заглушка с ценой и ссылкой
+            job.description_data = {"text": vac_details.description}
+            
+            await db.flush()
+            return job
+        
+        except Exception as e:
+            # Если это обычное объявление (не вакансия), API вернет ошибку.
+            # Мы просто логируем это как INFO и возвращаем None, не прерывая работу.
+            logger.info(f"ℹ️ Объявление {item_id} не является вакансией или Job API недоступен. Пропускаем синхронизацию параметров.")
+            error_msg = f"⚠️ Ошибка синхронизации вакансии {item_id} для аккаунта {account.name}: {e}"
+            await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
+            # Пытаемся найти уже существующую запись в базе, если она была создана ранее
+            return await db.scalar(select(JobContext).filter_by(external_id=str(item_id)))
+        
     
-    async def get_item_details(self, item_id: str, account: Account, db: AsyncSession):
+        
+    def _enrich_candidate_from_avito_payload(self, candidate: Candidate, payload: dict):
         """
-        Получение данных через Core API (Resources).
-        Работает для обычных объявлений (Услуги, Товары).
+        Универсальный парсинг: извлекает ФИО и контакты из отклика Job API
         """
-        # Используем путь, который сработал в curl
-        path = "/core/v1/items"
-        params = {"ids": str(item_id)}
+        applicant = payload.get("applicant", {})
+        data = applicant.get("data", {})
+        contacts = payload.get("contacts", {})
+
+        # --- 1. ПАРСИНГ ФИО (по вашему скриншоту) ---
+        if not candidate.full_name:
+            # Пытаемся достать детализированное ФИО
+            fn = data.get("full_name")  # Это объект с first_name, last_name...
+            
+            if isinstance(fn, dict):
+                # Собираем строку: Фамилия Имя Отчество
+                parts = [
+                    fn.get("last_name"),
+                    fn.get("first_name"),
+                    fn.get("patronymic")
+                ]
+                # Фильтруем None и пустые строки, соединяем через пробел
+                full_name_str = " ".join([p for p in parts if p]).strip()
+                if full_name_str:
+                    candidate.full_name = full_name_str
+            
+            # Если детализированного ФИО нет, берем из общего поля name или поиска
+            if not candidate.full_name:
+                candidate.full_name = (
+                    payload.get("search_full_name") or 
+                    data.get("name")
+                )
+
+        # --- 2. ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
+        if not candidate.phone_number:
+            search_phone = payload.get("search_phone")
+            phone_val = None
+            if search_phone:
+                phone_val = search_phone
+            else:
+                phones = contacts.get("phones", [])
+                if phones:
+                    phone_val = phones[0].get("value")
+            
+            if phone_val:
+                candidate.phone_number = str(phone_val)
+
+        # --- 3. ЗАПОЛНЕНИЕ ПРОФИЛЯ ---
+        profile = dict(candidate.profile_data or {})
+        # Дата рождения (из вашего скриншота)
+        if data.get("birthday") and "birthday" not in profile:
+            profile["birthday"] = data.get("birthday")
+        
+        # Город
+        if "city" not in profile:
+            profile["city"] = data.get("city") or applicant.get("city")
+            
+        candidate.profile_data = profile
+
+    async def _sync_dialogue_and_billing(self, account: Account, candidate: Candidate, job: JobContext, chat_id: str, db: AsyncSession, payload: dict, trigger_source: str = None):
+        if not chat_id: return None
+
+        dialogue = await db.scalar(select(Dialogue).filter_by(external_chat_id=chat_id))
+        
+        if dialogue:
+            await self._update_history_only(dialogue, account, chat_id, db)
+            return dialogue
+
+        # === НОВЫЙ ЛИД: ПЕРВИЧНОЕ ЗАПОЛНЕНИЕ ДАННЫХ ИЗ АВИТО ===
+        # self._enrich_candidate_from_avito_payload(candidate, payload)
+
+        # === БИЛЛИНГ: СПИСАНИЕ СРЕДСТВ ===
+        settings_stmt = select(AppSettings).filter_by(id=1).with_for_update()
+        settings_obj = await db.scalar(settings_stmt)
+        if not settings_obj:
+            settings_obj = AppSettings(id=1, balance=Decimal("0.00"))
+            db.add(settings_obj)
+            await db.flush() 
+
+        costs = settings_obj.costs or {}
+        cost_per_dialogue = Decimal(str(costs.get("dialogue", 19.00)))
+        current_balance = settings_obj.balance
+
+        if current_balance < cost_per_dialogue:
+            logger.error(
+                "💰 НЕДОСТАТОЧНО СРЕДСТВ!", 
+                extra={
+                    "balance": float(current_balance), 
+                    "cost": float(cost_per_dialogue),
+                    "account_name": account.name
+                }
+            )
+            if not settings_obj.low_limit_notified:
+                await mq.publish("tg_alerts", {
+                    "type": "system",
+                    "text": f"🚨 **БОТ ОСТАНОВЛЕН!** Недостаточно средств для аккаунта **{account.name}**. Баланс: {current_balance} руб.",
+                    "alert_type": "all"
+                })
+                settings_obj.low_limit_notified = True
+                await db.commit()
+            raise Exception(f"Insufficient funds for account {account.id}")
+
+        settings_obj.balance -= cost_per_dialogue
+        stats = dict(settings_obj.stats or {})
+        stats["total_spent"] = float(Decimal(str(stats.get("total_spent", 0))) + cost_per_dialogue)
+        stats["spent_on_dialogues"] = float(Decimal(str(stats.get("spent_on_dialogues", 0))) + cost_per_dialogue)
+        settings_obj.stats = stats
+
+        if settings_obj.balance < settings_obj.low_balance_threshold and not settings_obj.low_limit_notified:
+            await mq.publish("tg_alerts", {
+                "type": "system",
+                "text": f"📉 **Внимание!** Баланс аккаунта **{account.name}** близок к нулю: {settings_obj.balance} руб.",
+                "alert_type": "balance"
+            })
+            settings_obj.low_limit_notified = True
+        elif settings_obj.balance >= settings_obj.low_balance_threshold:
+            settings_obj.low_limit_notified = False
+
+        # --- ПОДГОТОВКА СИСТЕМНОЙ КОМАНДЫ (UTC) ---
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        
+        if trigger_source == "avito_search_found":
+            cmd_content = "[SYSTEM COMMAND] Ты нашел кандидата на вакансию Поздоровайся и предложи задать вопросы"
+        else:
+            cmd_content = "[SYSTEM COMMAND] Кандидат откликнулся на вакансию. Поздоровайся и предложи задать вопросы"
+
+        initial_history = [{
+            'message_id': f'no_msg_{int(now_utc.timestamp())}_{chat_id[-5:]}',
+            'role': 'user',
+            'content': cmd_content,
+            'timestamp_utc': now_utc.isoformat()
+        }]
+
+        # СОЗДАНИЕ ДИАЛОГА С НАЧАЛЬНОЙ ИСТОРИЕЙ
+        dialogue = Dialogue(
+            external_chat_id=chat_id, account_id=account.id, candidate_id=candidate.id,
+            vacancy_id=job.id if job else None, history=initial_history,
+            current_state="initial", status="new",
+            last_message_at=now_utc
+        )
+        db.add(dialogue)
         
         try:
-            # Делаем запрос
-            data = await self._request("GET", path, account, db, params=params)
-            
-            # В этом методе данные лежат в resources
-            resources = data.get("resources", [])
-            if not resources:
-                raise ValueError(f"Объявление {item_id} не найдено в API")
-            
-            item = resources[0] # Берем первое из списка
-
-            # Чистим город из адреса (Ставропольский край, Ставрополь... -> Ставрополь)
-            full_address = item.get("address", "")
-            city = "Не указан"
-            if full_address:
-                parts = [p.strip() for p in full_address.split(",")]
-                # Обычно город — это второй элемент после края, либо первый
-                city = parts[1] if len(parts) > 1 else parts[0]
-
-            from dataclasses import dataclass
-            @dataclass
-            class ItemDTO:
-                title: str
-                description: str
-                city: str
-                raw_json: dict
-
-            # Формируем описание из того, что есть (название + цена)
-            price = item.get("price", "Не указана")
-            description = (
-                f"📦 ОБЪЯВЛЕНИЕ: {item.get('title')}\n"
-                f"💰 Цена: {price} руб.\n"
-                f"📍 Адрес: {full_address}\n"
-                f"🔗 Ссылка: {item.get('url')}\n\n"
-                f"⚠️ Описание не получено через API, будет добавлено вручную."
-            )
-
-            return ItemDTO(
-                title=item.get("title", "Объявление"),
-                description=description,
-                city=city,
-                raw_json=item
-            )
+            await db.flush() 
         except Exception as e:
-            logger.error(f"❌ Ошибка Core API для item {item_id}: {e}")
+            logger.warning(f"Race condition при создании диалога: {e}. Откат.")
+            await db.rollback()
+            raise e
+        
+        db.add(AnalyticsEvent(
+            account_id=account.id, job_context_id=job.id if job else None, dialogue_id=dialogue.id,
+            event_type='lead_created', event_data={"cost": float(cost_per_dialogue), "trigger": trigger_source}
+        ))
+
+        await self._update_history_only(dialogue, account, chat_id, db)
+        return dialogue
+
+    async def _update_history_only(self, dialogue: Dialogue, account: Account, chat_id: str, db: AsyncSession):
+        try:
+            user_id = account.auth_data.get("user_id", "me")
+            api_messages = await avito.get_chat_messages(user_id, chat_id, account, db)
+            one_hour_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+            existing_ids = {str(m.get("message_id")) for m in (dialogue.history or [])}
+            new_history = list(dialogue.history or [])
+            changed = False
+            
+            for msg in api_messages:
+                m_id = str(msg.get("id"))
+                msg_ts = datetime.datetime.fromtimestamp(msg.get("created"), datetime.timezone.utc)
+                if msg_ts < one_hour_ago:
+                    continue # Пропускаем сообщение, если оно старше часа
+                
+                if m_id not in existing_ids:
+                    # Определяем роль
+                    direction = msg.get("direction")
+                    role = "user" if direction == "in" else "assistant"
+                    
+                    # ИСПОЛЬЗУЕМ ОБЩИЙ ПАРСЕР (который мы исправили в шаге 1)
+                    text_content = self._parse_message_content(msg.get("content", {}))
+                    if text_content.strip().startswith("[Системное сообщение]"):
+                        continue # Пропускаем это сообщение и идем к следующему
+                    # -----------------------------
+                    entry = {
+                        "role": role,
+                        "content": text_content,
+                        "message_id": m_id,
+                        "timestamp_utc": datetime.datetime.fromtimestamp(
+                            msg.get("created"), datetime.timezone.utc
+                        ).isoformat()
+                    }
+                    
+                    if role == "assistant":
+                        entry["state"] = dialogue.current_state
+                        entry["extracted_data"] = {}
+
+                    new_history.append(entry)
+                    changed = True
+            
+            if changed:
+                new_history.sort(key=lambda x: x.get("timestamp_utc") or "0000-01-01T00:00:00+00:00")
+                dialogue.history = new_history
+                dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
+                
+        except Exception as e:
+            error_msg = f"💥 Ошибка синхронизации истории для чата {chat_id}: {e}"
+            logger.exception("💥 Ошибка синхронизации истории")
+            await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
             raise e
 
-avito = AvitoClient()
+# Синглтон сервиса
+avito_connector = AvitoConnectorService()

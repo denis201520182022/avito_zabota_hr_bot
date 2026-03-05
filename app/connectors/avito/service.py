@@ -418,7 +418,7 @@ class AvitoConnectorService:
             params=params
         )
         
-        apps = resp_ids.get("applications", [])
+        apps = resp_ids.get("applies", [])
         
         if not apps:
             raise ValueError(f"Отклик для чата {chat_id} не найден в Job API (искали с {date_from})")
@@ -435,7 +435,7 @@ class AvitoConnectorService:
             json={"ids": [app_id]}
         )
         
-        app_details = details.get("applications", [])
+        app_details = details.get("applies", [])
         
         if not app_details:
             raise ValueError(f"Не удалось получить детали отклика {app_id}")
@@ -487,24 +487,39 @@ class AvitoConnectorService:
         
     def _enrich_candidate_from_avito_payload(self, candidate: Candidate, payload: dict):
         """
-        Универсальный парсинг: работает и для откликов (poller), и для поиска (search)
+        Универсальный парсинг: извлекает ФИО и контакты из отклика Job API
         """
-        # 1. Попытка взять данные из структуры отклика (poller)
         applicant = payload.get("applicant", {})
         data = applicant.get("data", {})
         contacts = payload.get("contacts", {})
 
-        # 2. Попытка взять данные из нашей структуры поиска (search)
-        search_name = payload.get("search_full_name")
-        search_phone = payload.get("search_phone")
-
-        # --- ЗАПОЛНЕНИЕ ФИО ---
+        # --- 1. ПАРСИНГ ФИО (по вашему скриншоту) ---
         if not candidate.full_name:
-            # Приоритет: 1. Поиск, 2. Прямое поле name отклика, 3. Объект full_name отклика
-            candidate.full_name = search_name or data.get("name") or data.get("full_name", {}).get("name")
+            # Пытаемся достать детализированное ФИО
+            fn = data.get("full_name")  # Это объект с first_name, last_name...
             
-        # --- ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
+            if isinstance(fn, dict):
+                # Собираем строку: Фамилия Имя Отчество
+                parts = [
+                    fn.get("last_name"),
+                    fn.get("first_name"),
+                    fn.get("patronymic")
+                ]
+                # Фильтруем None и пустые строки, соединяем через пробел
+                full_name_str = " ".join([p for p in parts if p]).strip()
+                if full_name_str:
+                    candidate.full_name = full_name_str
+            
+            # Если детализированного ФИО нет, берем из общего поля name или поиска
+            if not candidate.full_name:
+                candidate.full_name = (
+                    payload.get("search_full_name") or 
+                    data.get("name")
+                )
+
+        # --- 2. ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
         if not candidate.phone_number:
+            search_phone = payload.get("search_phone")
             phone_val = None
             if search_phone:
                 phone_val = search_phone
@@ -516,13 +531,13 @@ class AvitoConnectorService:
             if phone_val:
                 candidate.phone_number = str(phone_val)
 
-        # --- ЗАПОЛНЕНИЕ ОСТАЛЬНОГО (только для поллера) ---
-        # Для поиска эти поля заполняются в _enrich_from_resume
+        # --- 3. ЗАПОЛНЕНИЕ ПРОФИЛЯ ---
         profile = dict(candidate.profile_data or {})
-        if "citizenship" not in profile:
-            profile["citizenship"] = data.get("citizenship")
-        if "birthday" not in profile:
-            profile["birthday"] = data.get("birthday")
+        # # Дата рождения (из вашего скриншота)
+        # if data.get("birthday") and "birthday" not in profile:
+        #     profile["birthday"] = data.get("birthday")
+        
+        # Город
         if "city" not in profile:
             profile["city"] = data.get("city") or applicant.get("city")
             
@@ -538,7 +553,7 @@ class AvitoConnectorService:
             return dialogue
 
         # === НОВЫЙ ЛИД: ПЕРВИЧНОЕ ЗАПОЛНЕНИЕ ДАННЫХ ИЗ АВИТО ===
-        # self._enrich_candidate_from_avito_payload(candidate, payload)
+        self._enrich_candidate_from_avito_payload(candidate, payload)
 
         # === БИЛЛИНГ: СПИСАНИЕ СРЕДСТВ ===
         settings_stmt = select(AppSettings).filter_by(id=1).with_for_update()
