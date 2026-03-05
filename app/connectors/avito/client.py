@@ -214,11 +214,25 @@ class AvitoClient:
             # Авито возвращает timestamps в секундах или ISO строки в зависимости от версии
             cutoff_timestamp = (now_utc - datetime.timedelta(hours=24)).timestamp()
             
+            # 5. Фильтруем результат строго по времени (updated_at >= now - 24h)
+            cutoff_dt = now_utc - datetime.timedelta(hours=24)
+            
             filtered_apps = []
             for app in full_applications:
-                # В Job API обычно поле updatedAt в секундах
-                app_updated = app.get("updated_at", 0)
-                if app_updated >= cutoff_timestamp:
+                raw_updated = app.get("updated_at", 0)
+                
+                # Преобразуем полученное значение в timestamp (float)
+                if isinstance(raw_updated, str):
+                    try:
+                        # Авито часто шлет строки типа 2024-03-05T14:00:00Z
+                        # Заменяем Z на +00:00 для корректного парсинга
+                        app_updated_ts = datetime.datetime.fromisoformat(raw_updated.replace('Z', '+00:00')).timestamp()
+                    except Exception:
+                        app_updated_ts = 0
+                else:
+                    app_updated_ts = float(raw_updated)
+
+                if app_updated_ts >= cutoff_dt.timestamp():
                     filtered_apps.append(app)
 
             # 6. Сохраняем новый курсор в Redis (ставим TTL 2 дня, чтобы не копились вечно)
