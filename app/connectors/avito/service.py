@@ -423,29 +423,46 @@ class AvitoConnectorService:
 
     async def _fetch_application_data_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str) -> Optional[dict]:
         """
-        Получает полные данные отклика через Job API по chatId.
+        Получает полные данные отклика, СТРОГО проверяя соответствие chat_id.
         """
+        # Берем за последние 30 дней, чтобы наверняка найти
         date_from = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-        params = {"chatId": chat_id, "updatedAtFrom": date_from}
+        
+        # ВАЖНО: Авито ждет именно chatId (camelCase)
+        params = {
+            "chatId": str(chat_id), 
+            "updatedAtFrom": date_from,
+            "limit": 20 # Берем пачку, чтобы было из чего выбирать
+        }
 
         try:
-            # 1. Получаем ID отклика
+            # 1. Получаем список ID последних откликов
             resp_ids = await avito._request("GET", "/job/v1/applications/get_ids", account, db, params=params)
-            # В Job API v1 ключи могут быть 'applications' или 'applies'
             apps = resp_ids.get("applies") or resp_ids.get("applications", [])
 
             if not apps:
+                logger.info(f"🔍 [Job API] Для чата {chat_id} список откликов пуст.")
                 return None
 
-            app_id = apps[0]["id"]
-
-            # 2. Получаем детали
-            details = await avito._request("POST", "/job/v1/applications/get_by_ids", account, db, json={"ids": [app_id]})
+            # 2. Получаем детали для всей пачки (до 20 штук)
+            ids_to_check = [a["id"] for a in apps]
+            details = await avito._request("POST", "/job/v1/applications/get_by_ids", account, db, json={"ids": ids_to_check})
             app_list = details.get("applies") or details.get("applications", [])
-            
-            return app_list[0] if app_list else None
+
+            # 3. КРИТИЧЕСКАЯ ПРОВЕРКА: Ищем именно наш chat_id в деталях
+            for app in app_list:
+                # В структуре Авито chat_id лежит в contacts -> chat -> value
+                api_chat_id = app.get("contacts", {}).get("chat", {}).get("value")
+                
+                if str(api_chat_id) == str(chat_id):
+                    logger.info(f"✅ [Job API] Соответствие найдено! Это отклик: {app.get('id')}")
+                    return app
+
+            logger.warning(f"⚠️ [Job API] Получено {len(app_list)} откликов, но ни один не совпал с чатом {chat_id}")
+            return None
+
         except Exception as e:
-            logger.info(f"ℹ️ Не удалось получить данные отклика для чата {chat_id}: {e}")
+            logger.error(f"❌ Ошибка при поиске данных отклика: {e}", exc_info=True)
             return None
 
     async def _sync_vacancy(self, account: Account, db: AsyncSession, item_id: Any) -> Optional[JobContext]:
