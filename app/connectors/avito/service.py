@@ -30,7 +30,7 @@ class AvitoConnectorService:
         self.is_running = True
         logger.info("🚀 Запуск Avito Connector Service...")
         await self._setup_all_webhooks()
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        #self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def stop(self):
         logger.info("🛑 Остановка Avito Connector Service...")
@@ -55,7 +55,6 @@ class AvitoConnectorService:
             try:
                 stmt = select(Account).filter_by(platform="avito", is_active=True)
                 accounts = (await db.execute(stmt)).scalars().all()
-                logger.info(f"🔍 [Webhooks] Найдено {len(accounts)} активных аккаунтов в БД.")
                 for acc in accounts:
                     await avito.check_and_register_webhooks(acc, db, target_url)
             except Exception as e:
@@ -69,10 +68,6 @@ class AvitoConnectorService:
                 async with AsyncSessionLocal() as db:
                     stmt = select(Account).filter_by(platform="avito", is_active=True)
                     accounts = (await db.execute(stmt)).scalars().all()
-                    if accounts:
-                        logger.info(f"🕒 [Polling] Опрашиваю {len(accounts)} аккаунтов на наличие новых откликов...")
-                    else:
-                        logger.warning("⚠️ [Polling] В базе 0 активных аккаунтов Avito. Некого опрашивать.")
                     tasks = [self._poll_single_account(acc, db) for acc in accounts]
                     await asyncio.gather(*tasks)
             except Exception as e:
@@ -82,12 +77,9 @@ class AvitoConnectorService:
             await asyncio.sleep(self.poll_interval)
 
     async def _poll_single_account(self, account: Account, db: AsyncSession):
+        
         try:
             new_apps = await avito.get_new_applications(account, db)
-            if new_apps:
-                logger.info(f"✅ Аккаунт {account.name}: Найдено {len(new_apps)} новых откликов!")
-            else:
-                logger.debug(f"🔎 Аккаунт {account.name}: Новых откликов нет.")
             for app_data in new_apps:
                 await self.process_avito_event({
                     "source": "avito_poller",
@@ -264,8 +256,6 @@ class AvitoConnectorService:
             item_id = payload.get("vacancy_id")
             avito_author_id = str(payload.get("applicant", {}).get("user_id"))
             
-                
-
         elif source == "avito_search_found":
             external_chat_id = raw_data.get("chat_id")
             resume_id = raw_data.get("resume_id")
@@ -294,7 +284,7 @@ class AvitoConnectorService:
                 if is_system_msg:
                     logger.info(f"🚫 Игнорируем системное сообщение в СУЩЕСТВУЮЩЕМ чате {external_chat_id}")
                     return 
-                
+                # --- ДОБАВЬ ЭТО: "Обновление временного ID на реальный" ---
                 
 
                 # Обновляем историю нормальным сообщением
@@ -418,7 +408,7 @@ class AvitoConnectorService:
             params=params
         )
         
-        apps = resp_ids.get("applies", [])
+        apps = resp_ids.get("applications", [])
         
         if not apps:
             raise ValueError(f"Отклик для чата {chat_id} не найден в Job API (искали с {date_from})")
@@ -435,7 +425,7 @@ class AvitoConnectorService:
             json={"ids": [app_id]}
         )
         
-        app_details = details.get("applies", [])
+        app_details = details.get("applications", [])
         
         if not app_details:
             raise ValueError(f"Не удалось получить детали отклика {app_id}")
@@ -487,39 +477,24 @@ class AvitoConnectorService:
         
     def _enrich_candidate_from_avito_payload(self, candidate: Candidate, payload: dict):
         """
-        Универсальный парсинг: извлекает ФИО и контакты из отклика Job API
+        Универсальный парсинг: работает и для откликов (poller), и для поиска (search)
         """
+        # 1. Попытка взять данные из структуры отклика (poller)
         applicant = payload.get("applicant", {})
         data = applicant.get("data", {})
         contacts = payload.get("contacts", {})
 
-        # --- 1. ПАРСИНГ ФИО (по вашему скриншоту) ---
-        if not candidate.full_name:
-            # Пытаемся достать детализированное ФИО
-            fn = data.get("full_name")  # Это объект с first_name, last_name...
-            
-            if isinstance(fn, dict):
-                # Собираем строку: Фамилия Имя Отчество
-                parts = [
-                    fn.get("last_name"),
-                    fn.get("first_name"),
-                    fn.get("patronymic")
-                ]
-                # Фильтруем None и пустые строки, соединяем через пробел
-                full_name_str = " ".join([p for p in parts if p]).strip()
-                if full_name_str:
-                    candidate.full_name = full_name_str
-            
-            # Если детализированного ФИО нет, берем из общего поля name или поиска
-            if not candidate.full_name:
-                candidate.full_name = (
-                    payload.get("search_full_name") or 
-                    data.get("name")
-                )
+        # 2. Попытка взять данные из нашей структуры поиска (search)
+        search_name = payload.get("search_full_name")
+        search_phone = payload.get("search_phone")
 
-        # --- 2. ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
+        # --- ЗАПОЛНЕНИЕ ФИО ---
+        if not candidate.full_name:
+            # Приоритет: 1. Поиск, 2. Прямое поле name отклика, 3. Объект full_name отклика
+            candidate.full_name = search_name or data.get("name") or data.get("full_name", {}).get("name")
+            
+        # --- ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
         if not candidate.phone_number:
-            search_phone = payload.get("search_phone")
             phone_val = None
             if search_phone:
                 phone_val = search_phone
@@ -531,13 +506,13 @@ class AvitoConnectorService:
             if phone_val:
                 candidate.phone_number = str(phone_val)
 
-        # --- 3. ЗАПОЛНЕНИЕ ПРОФИЛЯ ---
+        # --- ЗАПОЛНЕНИЕ ОСТАЛЬНОГО (только для поллера) ---
+        # Для поиска эти поля заполняются в _enrich_from_resume
         profile = dict(candidate.profile_data or {})
-        # # Дата рождения (из вашего скриншота)
-        # if data.get("birthday") and "birthday" not in profile:
-        #     profile["birthday"] = data.get("birthday")
-        
-        # Город
+        if "citizenship" not in profile:
+            profile["citizenship"] = data.get("citizenship")
+        if "birthday" not in profile:
+            profile["birthday"] = data.get("birthday")
         if "city" not in profile:
             profile["city"] = data.get("city") or applicant.get("city")
             
@@ -553,7 +528,7 @@ class AvitoConnectorService:
             return dialogue
 
         # === НОВЫЙ ЛИД: ПЕРВИЧНОЕ ЗАПОЛНЕНИЕ ДАННЫХ ИЗ АВИТО ===
-        self._enrich_candidate_from_avito_payload(candidate, payload)
+        # self._enrich_candidate_from_avito_payload(candidate, payload)
 
         # === БИЛЛИНГ: СПИСАНИЕ СРЕДСТВ ===
         settings_stmt = select(AppSettings).filter_by(id=1).with_for_update()
@@ -695,3 +670,4 @@ class AvitoConnectorService:
 
 # Синглтон сервиса
 avito_connector = AvitoConnectorService()
+

@@ -1414,8 +1414,13 @@ class Engine:
                              ctx_logger.debug(f"Игнорируем {field_key}='{val}': стейт {current_state_at_update} не разрешает.")
                 if changed:
                     dialogue.candidate.profile_data = profile
-                    # --- НОВАЯ ЛОГИКА: МГНОВЕННЫЙ ЧЕК ---
-                    is_ok, reason = self._check_eligibility(profile)
+                    is_ok = True 
+                    reason = None
+                    # ПРОВЕРЯЕМ НА ОТКАЗ ТОЛЬКО ЕСЛИ МЫ ЕЩЕ НЕ В ПРОЦЕССЕ ЗАПИСИ
+                    SCHEDULING_STATES = ['init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb']
+                    
+                    if current_state_at_update not in SCHEDULING_STATES:
+                        is_ok, reason = self._check_eligibility(profile)
                     if not is_ok:
                         ctx_logger.info(f"⛔ МГНОВЕННЫЙ ОТКАЗ: {reason}. Прерываем анкету.")
                         new_state = 'qualification_failed'
