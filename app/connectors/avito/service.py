@@ -16,7 +16,7 @@ from app.utils.redis_lock import get_redis_client
 
 from .client import avito
 
-from app.utils.logger import logger, set_log_context, log_context
+logger = logging.getLogger("avito.service")
 
 class AvitoConnectorService:
     def __init__(self):
@@ -55,6 +55,7 @@ class AvitoConnectorService:
             try:
                 stmt = select(Account).filter_by(platform="avito", is_active=True)
                 accounts = (await db.execute(stmt)).scalars().all()
+                logger.info(f"🔍 [Webhooks] Найдено {len(accounts)} активных аккаунтов в БД.")
                 for acc in accounts:
                     await avito.check_and_register_webhooks(acc, db, target_url)
             except Exception as e:
@@ -68,6 +69,10 @@ class AvitoConnectorService:
                 async with AsyncSessionLocal() as db:
                     stmt = select(Account).filter_by(platform="avito", is_active=True)
                     accounts = (await db.execute(stmt)).scalars().all()
+                    if accounts:
+                        logger.info(f"🕒 [Polling] Опрашиваю {len(accounts)} аккаунтов на наличие новых откликов...")
+                    else:
+                        logger.warning("⚠️ [Polling] В базе 0 активных аккаунтов Avito. Некого опрашивать.")
                     tasks = [self._poll_single_account(acc, db) for acc in accounts]
                     await asyncio.gather(*tasks)
             except Exception as e:
@@ -77,9 +82,12 @@ class AvitoConnectorService:
             await asyncio.sleep(self.poll_interval)
 
     async def _poll_single_account(self, account: Account, db: AsyncSession):
-        set_log_context(account_id=account.id, account_name=account.name, source="avito_poller")
         try:
             new_apps = await avito.get_new_applications(account, db)
+            if new_apps:
+                logger.info(f"✅ Аккаунт {account.name}: Найдено {len(new_apps)} новых откликов!")
+            else:
+                logger.debug(f"🔎 Аккаунт {account.name}: Новых откликов нет.")
             for app_data in new_apps:
                 await self.process_avito_event({
                     "source": "avito_poller",
@@ -221,11 +229,7 @@ class AvitoConnectorService:
         
         avito_user_id = raw_data.get("avito_user_id") 
         account_id = raw_data.get("account_id")      
-        set_log_context(
-            source=source,
-            avito_user_id=avito_user_id,
-            account_id=account_id
-        )
+        
 
         external_chat_id = None
         resume_id = None
@@ -245,8 +249,8 @@ class AvitoConnectorService:
             if text.strip().startswith("[Системное сообщение]"):
                 is_system_msg = True
 
-            if external_chat_id:
-                set_log_context(chat_id=external_chat_id)
+            
+                
 
             # Игнорируем эхо (сообщения бота)
             if avito_author_id and str(avito_author_id) == str(avito_user_id):
@@ -259,8 +263,8 @@ class AvitoConnectorService:
             resume_id = str(payload.get("applicant", {}).get("resume_id"))
             item_id = payload.get("vacancy_id")
             avito_author_id = str(payload.get("applicant", {}).get("user_id"))
-            if external_chat_id:
-                set_log_context(chat_id=external_chat_id)
+            
+                
 
         elif source == "avito_search_found":
             external_chat_id = raw_data.get("chat_id")
@@ -268,8 +272,7 @@ class AvitoConnectorService:
             item_id = raw_data.get("vacancy_id")
             # Для поиска автор - это ID кандидата, переданный извне
             avito_author_id = str(raw_data.get("avito_user_id_candidate")) 
-            if external_chat_id:
-                set_log_context(chat_id=external_chat_id)
+            
 
         async with AsyncSessionLocal() as db:
             # 2. Находим аккаунт владельца
@@ -291,7 +294,7 @@ class AvitoConnectorService:
                 if is_system_msg:
                     logger.info(f"🚫 Игнорируем системное сообщение в СУЩЕСТВУЮЩЕМ чате {external_chat_id}")
                     return 
-                # --- ДОБАВЬ ЭТО: "Обновление временного ID на реальный" ---
+                
                 
 
                 # Обновляем историю нормальным сообщением
@@ -677,5 +680,3 @@ class AvitoConnectorService:
 
 # Синглтон сервиса
 avito_connector = AvitoConnectorService()
-
-
