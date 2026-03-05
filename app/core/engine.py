@@ -936,7 +936,7 @@ class Engine:
                 clean_history = [
                     msg for msg in raw_history 
                     if not self._is_technical_message(msg.get('content', '')) 
-                    and not str(msg.get('content', '')).startswith('[SYSTEM')
+                    
                 ]
                 history_for_llm = clean_history[-25:]
                 

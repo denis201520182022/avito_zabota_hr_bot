@@ -259,34 +259,29 @@ class AvitoClient:
         return data.get("messages", [])
 
     async def get_job_details(self, vacancy_id: str, account: Account, db: AsyncSession):
-        path = "/job/v2/vacancies/batch"
-        # 1. Убираем ограничение по fields или добавляем все нужные, включая 'params' и 'salary'
-        payload = {
-            "ids": [int(vacancy_id)],
-            "fields": ["title", "description", "addressDetails", "salary", "url"],
-            "params": [
-                "address", "experience", "schedule", "employment", 
-                "payout_frequency", "age_preferences", "bonuses"
-            ]
-        }
+        # Используем правильный путь с ID вакансии в строке
+        path = f"/job/v2/vacancies/{vacancy_id}"
         
-        data = await self._request("POST", path, account, db, json=payload)
+        # Делаем GET запрос. По документации, если не передавать fields/params, 
+        # API вернет все доступные поля по умолчанию.
+        data = await self._request("GET", path, account, db)
         
-        if not data or len(data) == 0:
-            raise ValueError("Vacancy not found")
+        if not data:
+            raise ValueError(f"Vacancy {vacancy_id} not found")
             
-        vac = data[0]
+        # В этом методе ответ — это сразу объект вакансии (не список)
+        vac = data
         
-        # 2. Формируем расширенный текст со всеми деталями
+        # Формируем полный текст для базы данных
         full_description_text = self._format_vacancy_full_text(vac)
 
         from dataclasses import dataclass
         @dataclass
         class VacDTO:
             title: str
-            description: str # Здесь теперь будет "красивый" полный текст
+            description: str
             city: str
-            raw_json: dict   # Добавим на всякий случай и сырые данные
+            raw_json: dict
 
         return VacDTO(
             title=vac.get("title", "Без названия"),
@@ -296,49 +291,73 @@ class AvitoClient:
         )
 
     def _format_vacancy_full_text(self, vac: dict) -> str:
-        """Вспомогательный метод для превращения JSON Авито в читаемый текст с заголовками"""
         lines = []
         
         # Заголовок и ссылка
-        lines.append(f"📋 ВАКАНСИЯ: {vac.get('title')}")
+        lines.append(f"📋 ВАКАНСИЯ: {vac.get('title', 'Не указано')}")
         if vac.get('url'):
             lines.append(f"🔗 Ссылка: https://www.avito.ru{vac.get('url')}")
         lines.append("")
 
-        # Зарплата
+        # Зарплата (может быть числом или объектом)
         salary = vac.get('salary')
-        if isinstance(salary, (int, float)):
-            lines.append(f"💰 Зарплата: {salary} руб.")
-        elif isinstance(salary, dict):
+        if isinstance(salary, dict):
             lines.append(f"💰 Зарплата: от {salary.get('from')} до {salary.get('to')} руб.")
+        elif salary:
+            lines.append(f"💰 Зарплата: {salary} руб.")
         
-        # Локация
+        # Локация и координаты
         addr = vac.get('addressDetails', {})
-        lines.append(f"📍 Адрес: {addr.get('city', '')}, {addr.get('address', '')}")
+        if addr:
+            lines.append(f"📍 Локация: {addr.get('province', '')}, {addr.get('city', '')}, {addr.get('address', '')}")
+            coords = addr.get('coordinates', {})
+            if coords:
+                lines.append(f"🌐 Координаты: {coords.get('latitude')}, {coords.get('longitude')}")
         lines.append("")
 
-        # Характеристики (params)
+        # Условия из блока params
         params = vac.get('params', {})
         if params:
-            lines.append("🏗 УСЛОВИЯ И ТРЕБОВАНИЯ:")
+            lines.append("🏗 ДЕТАЛИ И УСЛОВИЯ:")
             mapping = {
-                "experience": "Опыт",
                 "schedule": "График",
+                "experience": "Опыт",
                 "employment": "Занятость",
-                "payout_frequency": "Выплаты",
-                "age_preferences": "Предпочтения",
-                "bonuses": "Бонусы"
+                "payout_frequency": "Частота выплат", # Добавили
+                "paid_period": "Период оплаты",
+                "registration_method": "Оформление",
+                "medical_book": "Медкнижка",
+                "is_company_car": "Авто компании",
+                "is_remote": "Удаленка",
+                "is_side_job": "Подработка",
+                "taxes": "Налоги",
+                "tools_availability": "Инструменты",
+                "worker_class": "Разряд/Класс", # Добавили
+                "work_format": "Формат",
+                "shifts": "Смены",
+                "salary_base_bonus": "Бонусы/Премии",
+                "salary_base_range": "Диапазон оклада", # Добавили
+                "age_preferences": "Предпочтения по возрасту",
+                "profession": "Профессия", # Добавили
+                "vehicle_type": "Тип транспорта", # Добавили
+                "work_days_per_week": "Дней в неделю", # Добавили
+                "work_hours_per_day": "Часов в день", # Добавили
+                "retail_equipment_type": "Торговое оборудование", # Добавили
+                "retail_shop_type": "Тип магазина", # Добавили
+                "vacancy_code": "Код вакансии" # Добавили
             }
+
             for key, label in mapping.items():
                 val = params.get(key)
                 if val:
                     if isinstance(val, list): val = ", ".join(map(str, val))
+                    elif isinstance(val, dict): val = f"от {val.get('from')} до {val.get('to')}"
                     lines.append(f"  • {label}: {val}")
             lines.append("")
 
-        # Основное описание
-        lines.append("📝 ОПИСАНИЕ:")
-        lines.append(vac.get('description', 'Нет описания'))
+        # Описание
+        lines.append("📝 ПОЛНОЕ ОПИСАНИЕ:")
+        lines.append(vac.get('description', 'Описание отсутствует'))
         
         return "\n".join(lines)
     
