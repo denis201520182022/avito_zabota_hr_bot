@@ -77,7 +77,7 @@ class AvitoConnectorService:
             await asyncio.sleep(self.poll_interval)
 
     async def _poll_single_account(self, account: Account, db: AsyncSession):
-        
+
         try:
             new_apps = await avito.get_new_applications(account, db)
             for app_data in new_apps:
@@ -96,7 +96,7 @@ class AvitoConnectorService:
     def _parse_message_content(self, content_data: dict) -> str:
         """Единая логика извлечения текста из сложной структуры Авито"""
         text_content = content_data.get("text")
-        
+
         if not text_content:
             if content_data.get("image"):
                 text_content = "[Вложение: Изображение]"
@@ -125,7 +125,7 @@ class AvitoConnectorService:
                 return
 
             msg_id = str(msg_data.get("id"))
-            
+
             # Проверка на дубликаты (вдруг уже есть)
             existing_ids = {str(m.get("message_id")) for m in (dialogue.history or [])}
             if msg_id in existing_ids:
@@ -135,7 +135,7 @@ class AvitoConnectorService:
             author_id = str(msg_data.get("author_id"))
             # Наш ID (бота). Берем из базы.
             my_user_id = str(account.auth_data.get("user_id"))
-            
+
             # Если автор - это мы, то роль assistant, иначе user
             role = "assistant" if author_id == my_user_id else "user"
 
@@ -149,14 +149,14 @@ class AvitoConnectorService:
             if content_text.strip().startswith("[Системное сообщение]"):
                 logger.info(f"🚫 Игнорируем системное сообщение из вебхука в чате {dialogue.external_chat_id}")
                 return # Просто выходим, не добавляя в историю
-            
+
             new_entry = {
                 "role": role,
                 "content": content_text,
                 "message_id": msg_id,
                 "timestamp_utc": timestamp_utc
             }
-            
+
             # Если это исходящее от нас, добавляем контекст
             if role == "assistant":
                 new_entry["state"] = dialogue.current_state
@@ -165,23 +165,50 @@ class AvitoConnectorService:
             # Добавляем в историю
             history = list(dialogue.history or [])
             history.append(new_entry)
-            
+
             # Сортируем на всякий случай, чтобы порядок был верным
             history.sort(key=lambda x: x.get("timestamp_utc") or "0000-01-01T00:00:00+00:00")
-            
+
             dialogue.history = history
             dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
-            
+
             logger.info(f"⚡ Сообщение {msg_id} добавлено из вебхука мгновенно.")
 
         except Exception as e:
             logger.error(f"⚠️ Ошибка при ручном добавлении вебхука в историю: {e}")
             # Не падаем, так как следом пойдет _update_history_only и починит всё
 
+    def _extract_fio_from_app_data(self, app_data: dict) -> Optional[str]:
+        """
+        Извлекает ФИО из структуры applicant -> data -> full_name 
+        (согласно скриншотам документации Авито)
+        """
+        try:
+            applicant_data = app_data.get("applicant", {}).get("data", {})
+            full_name = applicant_data.get("full_name")
+            
+            if full_name and isinstance(full_name, dict):
+                # Собираем из частей: Фамилия Имя Отчество
+                parts = [
+                    full_name.get("last_name"),
+                    full_name.get("first_name"),
+                    full_name.get("patronymic")
+                ]
+                # Фильтруем None и пустые строки, соединяем пробелом
+                fio = " ".join([p for p in parts if p]).strip()
+                if fio:
+                    return fio
+            
+            # Фолбэк: если full_name нет, пробуем поле name
+            return applicant_data.get("name")
+        except Exception as e:
+            logger.debug(f"Не удалось распарсить ФИО из данных отклика: {e}")
+            return None
+    
     async def _accumulate_and_dispatch(self, dialogue: Dialogue, job: JobContext, source: str):
         redis = get_redis_client()
         lock_key = f"debounce_lock:{dialogue.external_chat_id}"
-        
+
         if await redis.get(lock_key):
             logger.info(f"⏳ Сообщение для чата {dialogue.external_chat_id} добавлено в очередь ожидания.")
             return
@@ -191,7 +218,7 @@ class AvitoConnectorService:
         async def wait_and_push():
             try:
                 await asyncio.sleep(5)
-                
+
                 engine_task = {
                     "dialogue_id": dialogue.id,
                     "account_id": dialogue.account_id,
@@ -200,11 +227,11 @@ class AvitoConnectorService:
                     "platform": "avito",
                     "trigger": source
                 }
-                
+
                 await mq.publish("engine_tasks", engine_task)
                 # ЛОГ ПЕРЕНЕСЕН СЮДА:
                 logger.info(f"🚀 [Debounce] Пачка сообщений для диалога {dialogue.id} отправлена в Engine")
-                
+
             except Exception as e:
                 error_msg = f"💥 Ошибка в фоновом накопителе Debounce: {e}"
                 logger.error(error_msg, exc_info=True)
@@ -218,15 +245,15 @@ class AvitoConnectorService:
     async def process_avito_event(self, raw_data: dict):
         source = raw_data.get("source")
         payload = raw_data.get("payload", {})
-        
-        avito_user_id = raw_data.get("avito_user_id") 
-        account_id = raw_data.get("account_id")      
-        
+
+        avito_user_id = raw_data.get("avito_user_id")
+        account_id = raw_data.get("account_id")
+
 
         external_chat_id = None
         resume_id = None
         item_id = None
-        avito_author_id = None 
+        avito_author_id = None
         is_system_msg = False
 
         # 1. Извлекаем данные в зависимости от источника
@@ -235,19 +262,19 @@ class AvitoConnectorService:
             external_chat_id = msg_val.get("chat_id")
             item_id = msg_val.get("item_id")
             avito_author_id = str(msg_val.get("author_id")) if msg_val.get("author_id") else None
-            
+
             # Проверка на системное сообщение
             text = msg_val.get("content", {}).get("text", "")
             if text.strip().startswith("[Системное сообщение]"):
                 is_system_msg = True
 
-            
-                
+
+
 
             # Игнорируем эхо (сообщения бота)
             if avito_author_id and str(avito_author_id) == str(avito_user_id):
                 logger.info(f"🚫 Игнорируем эхо-сообщение от бота в чате {external_chat_id}")
-                return 
+                return
 
         elif source == "avito_poller":
             contacts = payload.get("contacts", {})
@@ -255,14 +282,14 @@ class AvitoConnectorService:
             resume_id = str(payload.get("applicant", {}).get("resume_id"))
             item_id = payload.get("vacancy_id")
             avito_author_id = str(payload.get("applicant", {}).get("user_id"))
-            
+
         elif source == "avito_search_found":
             external_chat_id = raw_data.get("chat_id")
             resume_id = raw_data.get("resume_id")
             item_id = raw_data.get("vacancy_id")
             # Для поиска автор - это ID кандидата, переданный извне
-            avito_author_id = str(raw_data.get("avito_user_id_candidate")) 
-            
+            avito_author_id = str(raw_data.get("avito_user_id_candidate"))
+
 
         async with AsyncSessionLocal() as db:
             # 2. Находим аккаунт владельца
@@ -280,12 +307,17 @@ class AvitoConnectorService:
             dialogue = (await db.execute(stmt)).scalar_one_or_none()
 
             if dialogue:
+                # --- ДОБАВЬ ЭТОТ БЛОК ---
+                if source == "avito_poller":
+                    logger.info(f"♻️ Поллинг прислал существующий чат {external_chat_id}. Игнорируем (уже обработан).")
+                    return # Сразу выходим, не обновляя историю и не отправляя в Engine
+                
                 # --- ЛОГИКА ДЛЯ СУЩЕСТВУЮЩЕГО ДИАЛОГА ---
                 if is_system_msg:
                     logger.info(f"🚫 Игнорируем системное сообщение в СУЩЕСТВУЮЩЕМ чате {external_chat_id}")
-                    return 
+                    return
                 # --- ДОБАВЬ ЭТО: "Обновление временного ID на реальный" ---
-                
+
 
                 # Обновляем историю нормальным сообщением
                 if source == "avito_webhook":
@@ -293,52 +325,57 @@ class AvitoConnectorService:
                 await self._update_history_only(dialogue, account, external_chat_id, db)
 
             else:
-                # --- ЛОГИКА ДЛЯ НОВОГО ДИАЛОГА ---
+                ## --- ЛОГИКА ДЛЯ НОВОГО ДИАЛОГА ---
                 if is_system_msg:
-                    logger.info(f"🆕 Системное сообщение в НОВОМ чате {external_chat_id}. Инициализируем диалог.")
+                    logger.info(f"🆕 Системное сообщение в НОВОМ чате {external_chat_id}. Инициализация.")
 
-                # Определяем идентификатор кандидата (resume_id в приоритете)
-                # 1. Сначала пытаемся найти resume_id (для вакансий)
-                if not resume_id:
-                    try:
-                        resume_id = await self._fetch_resume_id_by_chat_id(account, db, external_chat_id)
-                    except Exception:
-                        resume_id = None
+                # 1. Получаем данные отклика (для ФИО и resume_id)
+                app_data = None
+                if source == "avito_poller":
+                    app_data = payload 
+                else:
+                    app_data = await self._fetch_application_data_by_chat_id(account, db, external_chat_id)
 
-                # 2. Формируем БАЗОВЫЙ ID (либо резюме, либо автор, либо заглушка)
+                # 2. Извлекаем ключевые данные
+                extracted_fio = self._extract_fio_from_app_data(app_data) if app_data else None
+                resume_id = str(app_data.get("applicant", {}).get("resume_id")) if app_data and app_data.get("applicant") else None
+
+                # 3. Формируем уникальный ключ кандидата
                 base_id = resume_id or (avito_author_id if avito_author_id and avito_author_id != "1" else f"temp_{external_chat_id[-8:]}")
-                
-                # 3. ФОРМИРУЕМ УНИКАЛЬНЫЙ СОСТАВНОЙ КЛЮЧ: ЮЗЕР + ВАКАНСИЯ
-                # Теперь platform_user_id будет выглядеть так: "12345_67890"
                 unique_candidate_key = f"{base_id}_{item_id}"
 
-                # 4. Ищем или создаем кандидата по этому составному ключу
+                # 4. Ищем или создаем кандидата (с обработкой Race Condition)
                 candidate = await db.scalar(select(Candidate).filter_by(platform_user_id=unique_candidate_key))
                 if not candidate:
                     try:
                         async with db.begin_nested():
                             candidate = Candidate(
-                                platform_user_id=unique_candidate_key, 
-                                profile_data={"note": f"Unique candidate for context {item_id}"}
+                                platform_user_id=unique_candidate_key,
+                                full_name=extracted_fio, # <--- ЗАПИСАЛИ ФИО
+                                profile_data={"note": f"Context {item_id}"}
                             )
                             db.add(candidate)
                             await db.flush()
                     except Exception:
                         await db.rollback()
                         candidate = await db.scalar(select(Candidate).filter_by(platform_user_id=unique_candidate_key))
+                
+                # Если кандидат уже был, но имени нет — пробуем обновить
+                elif extracted_fio and not candidate.full_name:
+                    candidate.full_name = extracted_fio
 
                 # 5. Синхронизируем вакансию
                 job_context = None
                 if item_id:
                     try:
                         job_context = await self._sync_vacancy(account, db, item_id)
-                    except:
-                        logger.info(f"ℹ️ Контекст объявления {item_id} не подтянут, продолжаем.")
+                    except Exception:
+                        logger.info(f"ℹ️ Контекст объявления {item_id} не подтянут.")
 
                 # 6. Биллинг и создание диалога
                 dialogue = await self._sync_dialogue_and_billing(
-                    account, candidate, job_context, external_chat_id, db, 
-                    payload if source == "avito_poller" else {},
+                    account, candidate, job_context, external_chat_id, db,
+                    app_data if app_data else {},
                     trigger_source=source
                 )
 
@@ -349,7 +386,7 @@ class AvitoConnectorService:
                 else:
                     # Даже если это было системное сообщение, Engine проверит историю и отправит приветствие
                     await self._accumulate_and_dispatch(dialogue, dialogue.vacancy, source)
-            
+
             await db.commit()
 
     def _enrich_from_resume(self, candidate: Candidate, resume: dict):
@@ -384,64 +421,40 @@ class AvitoConnectorService:
 
 
 
-    async def _fetch_resume_id_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str) -> str:
+    async def _fetch_application_data_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str) -> Optional[dict]:
         """
-        Метод-мост: находит resume_id через Job API, используя фильтр chatId.
-        Теперь с обязательным параметром updatedAtFrom.
+        Получает полные данные отклика через Job API по chatId.
         """
-        # Определяем дату, начиная с которой искать (например, за последние 30 дней)
-        # Этого достаточно, чтобы найти активный отклик.
         date_from = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        params = {"chatId": chat_id, "updatedAtFrom": date_from}
 
-        params = {
-            "chatId": chat_id,
-            "updatedAtFrom": date_from  # <--- ТЕПЕРЬ ОБЯЗАТЕЛЬНО
-        }
+        try:
+            # 1. Получаем ID отклика
+            resp_ids = await avito._request("GET", "/job/v1/applications/get_ids", account, db, params=params)
+            # В Job API v1 ключи могут быть 'applications' или 'applies'
+            apps = resp_ids.get("applies") or resp_ids.get("applications", [])
 
-        # 1. Получаем ID отклика по chatId
-        logger.info(f"🔍 Запрос в Job API для поиска отклика по chatId: {chat_id}")
-        resp_ids = await avito._request(
-            "GET", 
-            "/job/v1/applications/get_ids", 
-            account, 
-            db, 
-            params=params
-        )
-        
-        apps = resp_ids.get("applications", [])
-        
-        if not apps:
-            raise ValueError(f"Отклик для чата {chat_id} не найден в Job API (искали с {date_from})")
+            if not apps:
+                return None
 
-        app_id = apps[0]["id"]
-        logger.info(f"✅ Найден ID отклика: {app_id}, запрашиваем детали...")
-        
-        # 2. Получаем детали отклика, чтобы вытащить resume_id
-        details = await avito._request(
-            "POST", 
-            "/job/v1/applications/get_by_ids", 
-            account, 
-            db, 
-            json={"ids": [app_id]}
-        )
-        
-        app_details = details.get("applications", [])
-        
-        if not app_details:
-            raise ValueError(f"Не удалось получить детали отклика {app_id}")
+            app_id = apps[0]["id"]
 
-        resume_id = str(app_details[0].get("applicant", {}).get("resume_id"))
-        logger.info(f"✅ Получен resume_id: {resume_id}")
-        
-        return resume_id
+            # 2. Получаем детали
+            details = await avito._request("POST", "/job/v1/applications/get_by_ids", account, db, json={"ids": [app_id]})
+            app_list = details.get("applies") or details.get("applications", [])
+            
+            return app_list[0] if app_list else None
+        except Exception as e:
+            logger.info(f"ℹ️ Не удалось получить данные отклика для чата {chat_id}: {e}")
+            return None
 
     async def _sync_vacancy(self, account: Account, db: AsyncSession, item_id: Any) -> Optional[JobContext]:
         if not item_id:
             return None
-        
+
         try:
             vac_details = None
-            
+
             # 1. Пробуем как вакансию
             try:
                 vac_details = await avito.get_job_details(str(item_id), account, db)
@@ -455,15 +468,15 @@ class AvitoConnectorService:
             if not job:
                 job = JobContext(external_id=str(item_id), account_id=account.id)
                 db.add(job)
-            
+
             job.title = vac_details.title
             job.city = vac_details.city
             # Сюда запишется наша заглушка с ценой и ссылкой
             job.description_data = {"text": vac_details.description}
-            
+
             await db.flush()
             return job
-        
+
         except Exception as e:
             # Если это обычное объявление (не вакансия), API вернет ошибку.
             # Мы просто логируем это как INFO и возвращаем None, не прерывая работу.
@@ -472,9 +485,9 @@ class AvitoConnectorService:
             await mq.publish("tg_alerts", {"type": "system", "text": error_msg})
             # Пытаемся найти уже существующую запись в базе, если она была создана ранее
             return await db.scalar(select(JobContext).filter_by(external_id=str(item_id)))
-        
-    
-        
+
+
+
     def _enrich_candidate_from_avito_payload(self, candidate: Candidate, payload: dict):
         """
         Универсальный парсинг: работает и для откликов (poller), и для поиска (search)
@@ -492,7 +505,7 @@ class AvitoConnectorService:
         if not candidate.full_name:
             # Приоритет: 1. Поиск, 2. Прямое поле name отклика, 3. Объект full_name отклика
             candidate.full_name = search_name or data.get("name") or data.get("full_name", {}).get("name")
-            
+
         # --- ЗАПОЛНЕНИЕ ТЕЛЕФОНА ---
         if not candidate.phone_number:
             phone_val = None
@@ -502,7 +515,7 @@ class AvitoConnectorService:
                 phones = contacts.get("phones", [])
                 if phones:
                     phone_val = phones[0].get("value")
-            
+
             if phone_val:
                 candidate.phone_number = str(phone_val)
 
@@ -515,14 +528,14 @@ class AvitoConnectorService:
             profile["birthday"] = data.get("birthday")
         if "city" not in profile:
             profile["city"] = data.get("city") or applicant.get("city")
-            
+
         candidate.profile_data = profile
 
     async def _sync_dialogue_and_billing(self, account: Account, candidate: Candidate, job: JobContext, chat_id: str, db: AsyncSession, payload: dict, trigger_source: str = None):
         if not chat_id: return None
 
         dialogue = await db.scalar(select(Dialogue).filter_by(external_chat_id=chat_id))
-        
+
         if dialogue:
             await self._update_history_only(dialogue, account, chat_id, db)
             return dialogue
@@ -536,7 +549,7 @@ class AvitoConnectorService:
         if not settings_obj:
             settings_obj = AppSettings(id=1, balance=Decimal("0.00"))
             db.add(settings_obj)
-            await db.flush() 
+            await db.flush()
 
         costs = settings_obj.costs or {}
         cost_per_dialogue = Decimal(str(costs.get("dialogue", 19.00)))
@@ -544,9 +557,9 @@ class AvitoConnectorService:
 
         if current_balance < cost_per_dialogue:
             logger.error(
-                "💰 НЕДОСТАТОЧНО СРЕДСТВ!", 
+                "💰 НЕДОСТАТОЧНО СРЕДСТВ!",
                 extra={
-                    "balance": float(current_balance), 
+                    "balance": float(current_balance),
                     "cost": float(cost_per_dialogue),
                     "account_name": account.name
                 }
@@ -579,7 +592,7 @@ class AvitoConnectorService:
 
         # --- ПОДГОТОВКА СИСТЕМНОЙ КОМАНДЫ (UTC) ---
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        
+
         if trigger_source == "avito_search_found":
             cmd_content = "[SYSTEM COMMAND] Ты нашел кандидата на вакансию Поздоровайся и предложи задать вопросы"
         else:
@@ -600,14 +613,14 @@ class AvitoConnectorService:
             last_message_at=now_utc
         )
         db.add(dialogue)
-        
+
         try:
-            await db.flush() 
+            await db.flush()
         except Exception as e:
             logger.warning(f"Race condition при создании диалога: {e}. Откат.")
             await db.rollback()
             raise e
-        
+
         db.add(AnalyticsEvent(
             account_id=account.id, job_context_id=job.id if job else None, dialogue_id=dialogue.id,
             event_type='lead_created', event_data={"cost": float(cost_per_dialogue), "trigger": trigger_source}
@@ -624,18 +637,18 @@ class AvitoConnectorService:
             existing_ids = {str(m.get("message_id")) for m in (dialogue.history or [])}
             new_history = list(dialogue.history or [])
             changed = False
-            
+
             for msg in api_messages:
                 m_id = str(msg.get("id"))
                 msg_ts = datetime.datetime.fromtimestamp(msg.get("created"), datetime.timezone.utc)
                 if msg_ts < one_hour_ago:
                     continue # Пропускаем сообщение, если оно старше часа
-                
+
                 if m_id not in existing_ids:
                     # Определяем роль
                     direction = msg.get("direction")
                     role = "user" if direction == "in" else "assistant"
-                    
+
                     # ИСПОЛЬЗУЕМ ОБЩИЙ ПАРСЕР (который мы исправили в шаге 1)
                     text_content = self._parse_message_content(msg.get("content", {}))
                     if text_content.strip().startswith("[Системное сообщение]"):
@@ -649,19 +662,19 @@ class AvitoConnectorService:
                             msg.get("created"), datetime.timezone.utc
                         ).isoformat()
                     }
-                    
+
                     if role == "assistant":
                         entry["state"] = dialogue.current_state
                         entry["extracted_data"] = {}
 
                     new_history.append(entry)
                     changed = True
-            
+
             if changed:
                 new_history.sort(key=lambda x: x.get("timestamp_utc") or "0000-01-01T00:00:00+00:00")
                 dialogue.history = new_history
                 dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
-                
+
         except Exception as e:
             error_msg = f"💥 Ошибка синхронизации истории для чата {chat_id}: {e}"
             logger.exception("💥 Ошибка синхронизации истории")
@@ -670,4 +683,3 @@ class AvitoConnectorService:
 
 # Синглтон сервиса
 avito_connector = AvitoConnectorService()
-
