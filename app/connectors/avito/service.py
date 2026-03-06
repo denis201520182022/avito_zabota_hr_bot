@@ -302,24 +302,32 @@ class AvitoConnectorService:
             dialogue = (await db.execute(stmt)).scalar_one_or_none()
 
             if dialogue:
-                # --- ЛОГИКА ДООБОГАЩЕНИЯ (если раньше не нашли ФИО) ---
-                if not dialogue.candidate.full_name or dialogue.candidate.full_name.startswith("temp_"):
-                    logger.info(f"🔍 ФИО всё еще пусто для {external_chat_id}. Пробуем подтянуть снова...")
+                # --- ЛОГИКА ДООБОГАЩЕНИЯ ФИО ---
+                cand = dialogue.candidate
+                # Проверяем, является ли имя пустым или системной заглушкой
+                is_name_empty = not cand.full_name or cand.full_name in [
+                    "Кандидат Авито #new", "Кандидат", "[null]", ""
+                ] or cand.full_name.startswith("temp_")
+
+                if is_name_empty:
+                    logger.info(f"🔍 ФИО требует обновления для {external_chat_id}. Пробуем подтянуть...")
                     
-                    # Пытаемся найти данные через Job API
-                    # В качестве item_id берем тот, что привязан к вакансии диалога
+                    # Пытаемся найти через Job API
                     v_id = dialogue.vacancy.external_id if dialogue.vacancy else item_id
                     app_data = await self._fetch_application_data_by_chat_id(account, db, external_chat_id, item_id=v_id)
-                    
                     extracted_fio = self._extract_fio_from_app_data(app_data) if app_data else None
                     
-                    # Если Job API все еще молчит — пробуем Messenger API (fallback)
+                    # Фолбэк на Messenger API
                     if not extracted_fio:
                         extracted_fio = await avito.get_chat_metadata(account, db, external_chat_id)
                     
                     if extracted_fio:
-                        dialogue.candidate.full_name = extracted_fio
-                        logger.info(f"✅ Имя кандидата [{extracted_fio}] успешно обновлено «на лету»!")
+                        cand.full_name = extracted_fio
+                        # ВАЖНО: сохраняем немедленно, чтобы не потерять данные при блокировках Engine
+                        await db.commit() 
+                        # После коммита обновляем объект, чтобы продолжить работу
+                        await db.refresh(cand)
+                        logger.info(f"✅ Имя кандидата [{extracted_fio}] сохранено в БД!")
                 # --- ДОБАВЬ ЭТОТ БЛОК ---
                 if source == "avito_poller":
                     logger.debug(f"♻️ Поллинг прислал существующий чат {external_chat_id}. Игнорируем (уже обработан).")
@@ -468,7 +476,7 @@ class AvitoConnectorService:
             for app in app_list:
                 api_chat_id = app.get("contacts", {}).get("chat", {}).get("value")
                 # ДОБАВЬ ЭТУ СТРОКУ:
-                logger.info(f"🧪 Сравниваем: из API [{api_chat_id}] <--> из вебхука [{chat_id}]")
+                logger.debug(f"🧪 Сравниваем: из API [{api_chat_id}] <--> из вебхука [{chat_id}]")
                 
                 if str(api_chat_id) == str(chat_id):
                     return app
