@@ -445,8 +445,10 @@ class AvitoConnectorService:
 
             # 3. Ищем соответствие по chat_id
             for app in app_list:
-                # Путь по скрину №2: contacts -> chat -> value
                 api_chat_id = app.get("contacts", {}).get("chat", {}).get("value")
+                # ДОБАВЬ ЭТУ СТРОКУ:
+                logger.info(f"🧪 Сравниваем: из API [{api_chat_id}] <--> из вебхука [{chat_id}]")
+                
                 if str(api_chat_id) == str(chat_id):
                     return app
 
