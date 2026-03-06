@@ -374,6 +374,33 @@ class AvitoClient:
         lines.append(vac.get('description', 'Описание отсутствует'))
         
         return "\n".join(lines)
+    async def get_chat_metadata(self, account: Account, db: AsyncSession, chat_id: str) -> Optional[str]:
+        """
+        Получение имени пользователя напрямую из чата через Messenger API V2
+        Согласно документации: ответ содержит список users с полями id и name.
+        """
+        try:
+            # Наш ID (бота)
+            my_user_id = str(account.auth_data.get("user_id"))
+            
+            # Путь из твоей документации
+            path = f"/messenger/v2/accounts/{my_user_id}/chats/{chat_id}"
+            
+            data = await self._request("GET", path, account, db)
+            
+            # Ищем в списке users того, чей ID не совпадает с ID бота
+            users = data.get("users", [])
+            for u in users:
+                # Сравниваем ID как строки на всякий случай
+                if str(u.get("id")) != my_user_id:
+                    name = u.get("name")
+                    if name:
+                        logger.info(f"👤 Имя [{name}] получено через Messenger API V2 (Fallback)")
+                        return name
+            return None
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка Messenger API при получении метаданных чата {chat_id}: {e}")
+            return None
     
     async def search_resumes(self, account: Account, db: AsyncSession, params: dict) -> dict:
         """

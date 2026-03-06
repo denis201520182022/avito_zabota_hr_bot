@@ -295,10 +295,31 @@ class AvitoConnectorService:
                 return
 
             # 3. Ищем существующий диалог
-            stmt = select(Dialogue).options(selectinload(Dialogue.vacancy)).filter_by(external_chat_id=external_chat_id)
+            stmt = select(Dialogue).options(
+                selectinload(Dialogue.vacancy), 
+                selectinload(Dialogue.candidate) # <--- Добавили это
+            ).filter_by(external_chat_id=external_chat_id)
             dialogue = (await db.execute(stmt)).scalar_one_or_none()
 
             if dialogue:
+                # --- ЛОГИКА ДООБОГАЩЕНИЯ (если раньше не нашли ФИО) ---
+                if not dialogue.candidate.full_name or dialogue.candidate.full_name.startswith("temp_"):
+                    logger.info(f"🔍 ФИО всё еще пусто для {external_chat_id}. Пробуем подтянуть снова...")
+                    
+                    # Пытаемся найти данные через Job API
+                    # В качестве item_id берем тот, что привязан к вакансии диалога
+                    v_id = dialogue.vacancy.external_id if dialogue.vacancy else item_id
+                    app_data = await self._fetch_application_data_by_chat_id(account, db, external_chat_id, item_id=v_id)
+                    
+                    extracted_fio = self._extract_fio_from_app_data(app_data) if app_data else None
+                    
+                    # Если Job API все еще молчит — пробуем Messenger API (fallback)
+                    if not extracted_fio:
+                        extracted_fio = await avito.get_chat_metadata(account, db, external_chat_id)
+                    
+                    if extracted_fio:
+                        dialogue.candidate.full_name = extracted_fio
+                        logger.info(f"✅ Имя кандидата [{extracted_fio}] успешно обновлено «на лету»!")
                 # --- ДОБАВЬ ЭТОТ БЛОК ---
                 if source == "avito_poller":
                     logger.debug(f"♻️ Поллинг прислал существующий чат {external_chat_id}. Игнорируем (уже обработан).")
