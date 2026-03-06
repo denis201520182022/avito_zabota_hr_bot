@@ -179,30 +179,22 @@ class AvitoConnectorService:
             # Не падаем, так как следом пойдет _update_history_only и починит всё
 
     def _extract_fio_from_app_data(self, app_data: dict) -> Optional[str]:
-        """
-        Извлекает ФИО из структуры applicant -> data -> full_name 
-        (согласно скриншотам документации Авито)
-        """
         try:
-            applicant_data = app_data.get("applicant", {}).get("data", {})
-            full_name = applicant_data.get("full_name")
+            data = app_data.get("applicant", {}).get("data", {})
             
-            if full_name and isinstance(full_name, dict):
-                # Собираем из частей: Фамилия Имя Отчество
-                parts = [
-                    full_name.get("last_name"),
-                    full_name.get("first_name"),
-                    full_name.get("patronymic")
-                ]
-                # Фильтруем None и пустые строки, соединяем пробелом
-                fio = " ".join([p for p in parts if p]).strip()
-                if fio:
-                    return fio
-            
-            # Фолбэк: если full_name нет, пробуем поле name
-            return applicant_data.get("name")
-        except Exception as e:
-            logger.debug(f"Не удалось распарсить ФИО из данных отклика: {e}")
+            # 1. Сначала пробуем готовое поле name (оно на скрине есть как строка)
+            name = data.get("name")
+            if name and len(name.strip()) > 1:
+                return name.strip()
+                
+            # 2. Если нет, собираем из объекта full_name
+            fn = data.get("full_name")
+            if fn and isinstance(fn, dict):
+                parts = [fn.get("last_name"), fn.get("first_name"), fn.get("patronymic")]
+                return " ".join([p for p in parts if p]).strip()
+                
+            return None
+        except:
             return None
     
     async def _accumulate_and_dispatch(self, dialogue: Dialogue, job: JobContext, source: str):
@@ -334,7 +326,8 @@ class AvitoConnectorService:
                 if source == "avito_poller":
                     app_data = payload 
                 else:
-                    app_data = await self._fetch_application_data_by_chat_id(account, db, external_chat_id)
+                    # Найти эту строку в process_avito_event:
+                    app_data = await self._fetch_application_data_by_chat_id(account, db, external_chat_id, item_id=item_id)
 
                 # 2. Извлекаем ключевые данные
                 extracted_fio = self._extract_fio_from_app_data(app_data) if app_data else None
@@ -421,48 +414,45 @@ class AvitoConnectorService:
 
 
 
-    async def _fetch_application_data_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str) -> Optional[dict]:
-        """
-        Получает полные данные отклика, СТРОГО проверяя соответствие chat_id.
-        """
-        # Берем за последние 30 дней, чтобы наверняка найти
+    async def _fetch_application_data_by_chat_id(self, account: Account, db: AsyncSession, chat_id: str, item_id: Any = None) -> Optional[dict]:
+    # Ищем за 30 дней
         date_from = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
         
-        # ВАЖНО: Авито ждет именно chatId (camelCase)
         params = {
-            "chatId": str(chat_id), 
             "updatedAtFrom": date_from,
-            "limit": 20 # Берем пачку, чтобы было из чего выбирать
+            "limit": 100  # Максимум по документации
         }
+        # Если есть ID вакансии, фильтруем по нему (это критично!)
+        if item_id:
+            params["vacancyIds"] = str(item_id)
 
         try:
-            # 1. Получаем список ID последних откликов
+            # 1. Получаем список ID
             resp_ids = await avito._request("GET", "/job/v1/applications/get_ids", account, db, params=params)
-            apps = resp_ids.get("applies") or resp_ids.get("applications", [])
+            
+            # Документация на скрине показывает массив, но иногда Авито шлет объект. Обрабатываем оба варианта:
+            apps = resp_ids if isinstance(resp_ids, list) else (resp_ids.get("applies") or resp_ids.get("applications", []))
 
             if not apps:
-                logger.info(f"🔍 [Job API] Для чата {chat_id} список откликов пуст.")
                 return None
 
-            # 2. Получаем детали для всей пачки (до 20 штук)
-            ids_to_check = [a["id"] for a in apps]
+            # 2. Берем детали
+            ids_to_check = [str(a["id"]) for a in apps]
             details = await avito._request("POST", "/job/v1/applications/get_by_ids", account, db, json={"ids": ids_to_check})
+            
+            # В get_by_ids точно есть ключ "applies" (согласно скрину)
             app_list = details.get("applies") or details.get("applications", [])
 
-            # 3. КРИТИЧЕСКАЯ ПРОВЕРКА: Ищем именно наш chat_id в деталях
+            # 3. Ищем соответствие по chat_id
             for app in app_list:
-                # В структуре Авито chat_id лежит в contacts -> chat -> value
+                # Путь по скрину №2: contacts -> chat -> value
                 api_chat_id = app.get("contacts", {}).get("chat", {}).get("value")
-                
                 if str(api_chat_id) == str(chat_id):
-                    logger.info(f"✅ [Job API] Соответствие найдено! Это отклик: {app.get('id')}")
                     return app
 
-            logger.warning(f"⚠️ [Job API] Получено {len(app_list)} откликов, но ни один не совпал с чатом {chat_id}")
             return None
-
         except Exception as e:
-            logger.error(f"❌ Ошибка при поиске данных отклика: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка Job API: {e}")
             return None
 
     async def _sync_vacancy(self, account: Account, db: AsyncSession, item_id: Any) -> Optional[JobContext]:
