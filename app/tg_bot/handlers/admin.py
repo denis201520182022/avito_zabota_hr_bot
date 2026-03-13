@@ -12,6 +12,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from aiogram.utils.formatting import Text, Bold, Italic, Code
 import io
 import datetime
+# Найдите строку с импортами из sqlalchemy.orm или добавьте новую:
+from sqlalchemy.orm import joinedload
 from aiogram.types import BufferedInputFile
 from sqlalchemy.orm.attributes import flag_modified
 from app.db.models import (
@@ -100,7 +102,8 @@ async def limits_menu(message: Message, session: AsyncSession):
         return
 
     # Тянем квоты поиска
-    quota_stmt = select(AvitoSearchQuota).join(Account)
+    # Тянем квоты поиска ПЛЮС сразу загружаем связанные аккаунты
+    quota_stmt = select(AvitoSearchQuota).options(joinedload(AvitoSearchQuota.account))
     quotas = (await session.execute(quota_stmt)).scalars().all()
 
     stats = settings.stats or {}
@@ -135,7 +138,6 @@ async def limits_menu(message: Message, session: AsyncSession):
     # Для редактирования сообщения в будущем, лучше использовать message.answer
     await message.answer(**content.as_kwargs(), reply_markup=limits_menu_keyboard)
 
-    await message.answer(**content.as_kwargs(), reply_markup=limits_menu_keyboard)
 @router.callback_query(F.data == "set_limit")
 async def start_set_balance(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsManagement.set_balance)
