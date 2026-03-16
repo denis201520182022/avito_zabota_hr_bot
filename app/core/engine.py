@@ -316,6 +316,7 @@ class Engine:
         2. Гражданство: Только РФ
         3. Опыт: >= 6 месяцев
         4. Готовность: Да
+        5. Локация РФ: да
         """
         
         # --- Критерий 1: Возраст (20-45) ---
@@ -358,6 +359,14 @@ class Engine:
         # Если кандидат явно сказал "нет"
         if readiness in ["нет", "no", "не готов", "false"]:
             return False, "not_ready_to_work"
+
+        # --- НОВОЕ: Критерий 5: Нахождение в РФ ---
+        location = profile.get("location_is_rf")
+        if location is not None:
+            loc_low = str(location).strip().lower()
+            # Отказываем только если получен четкий отрицательный ответ
+            if loc_low in ["нет", "no", "false", "не в рф", "за границей"]:
+                return False, "not_in_rf"
 
         # Если все проверки пройдены (или данных пока нет)
         return True, None
@@ -539,6 +548,9 @@ class Engine:
             'awaiting_citizenship': ['#QUALIFICATION_RULES#'],
             'clarifying_citizenship': ['#QUALIFICATION_RULES#', '#CLARI#'],
             'awaiting_age': ['#QUALIFICATION_RULES#'],
+            'awaiting_experience': ['#QUALIFICATION_RULES#'],
+            'awaiting_readiness': ['#QUALIFICATION_RULES#'],
+            'awaiting_location': ['#QUALIFICATION_RULES#'],
             'clarifying_anything': ['#QUALIFICATION_RULES#'],
             'qualification_complete': ['#QUALIFICATION_RULES#'],
 
@@ -866,21 +878,51 @@ class Engine:
             # 1. Извлечь телефоны/ФИО для БД
             # 2. Подготовить замаскированный текст для LLM
             
+            # === 6. PII MASKING & PREPARATION ===
             all_masked_content = []
             
             for pm in pending_messages:
-                # pm - это реальный объект из dialogue.history (dict)
                 original_content = pm.get('content', '')
                 
                 # Маскируем и пытаемся вытащить телефон/ФИО регулярками
                 masked_content, extracted_fio, extracted_phone = extract_and_mask_pii(original_content)
 
-                # Если нашли телефон регуляркой - сразу пишем в кандидата
                 if extracted_phone:
-                    dialogue.candidate.phone_number = extracted_phone
-                    ctx_logger.info(f"📞 Извлечен телефон из текста: {extracted_phone}")
+                    # ПРОВЕРКА: Номер должен быть мобильным (начинаться с 79 в нормализованном виде)
+                    if extracted_phone.startswith('79') and len(extracted_phone) == 11:
+                        dialogue.candidate.phone_number = extracted_phone
+                        ctx_logger.info(f"📞 Извлечен валидный мобильный телефон: {extracted_phone}")
+                    else:
+                        # ТРИГГЕР НА ПЕРЕСПРОС (Найден номер, но он не мобильный)
+                        ctx_logger.warning(f"⚠️ Обнаружен некорректный номер (не на 9): {extracted_phone}")
 
-                # Собираем текст для отправки в LLM
+                        # 1. Формируем системную инструкцию
+                        sys_phone_cmd = {
+                            'message_id': f'sys_invalid_phone_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] Пользователь указал номер, но он не похож на мобильный. "
+                                f"Нам нужен номер, начинающийся на 89... или +79... "
+                                f"Вежливо скажи, что этот номер не подходит, и попроси прислать корректный Российский номер, если есть."
+                            ),
+                            'timestamp_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        }
+
+                        # 2. Сохраняем команду в историю
+                        dialogue.history = (dialogue.history or []) + [sys_phone_cmd]
+                        dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
+                        
+                        # 3. Фиксируем в БД и отправляем на немедленную перегенерацию ответа
+                        await db.commit()
+                        await mq.publish("engine_tasks", {
+                            "dialogue_id": dialogue.id, 
+                            "trigger": "invalid_phone_retry"
+                        })
+                        
+                        ctx_logger.info(f"♻️ Отправлено на переспрос телефона (неверный формат).")
+                        return # ПРЕРЫВАЕМ текущую обработку, так как бот сейчас ответит по системной команде
+
+                # Собираем текст для отправки в LLM (если номер был валидным или его не было вовсе)
                 all_masked_content.append(masked_content)
 
             combined_masked_message = "\n".join(all_masked_content)
@@ -1029,6 +1071,7 @@ class Engine:
                 'awaiting_age',
                 'awaiting_experience',
                 'awaiting_readiness',
+                'awaiting_location',
                 
                 'clarifying_anything',
                 'clarifying_declined_vacancy',
@@ -1043,6 +1086,7 @@ class Engine:
                 'declined_vacancy',
                 'declined_interview',
                 'call_later'
+                
             }
 
             if new_state not in ALLOWED_STATES:
@@ -1387,7 +1431,8 @@ class Engine:
                 mapping = {
                     
                     "experience": ["awaiting_experience", "clarifying_anything"],
-                    "readiness": ["awaiting_readiness", "clarifying_anything"]
+                    "readiness": ["awaiting_readiness", "clarifying_anything"],
+                    "location_is_rf": ["awaiting_location", "clarifying_anything"]
                 }
                 
                 for field_key, allowed_states in mapping.items():
@@ -1501,7 +1546,8 @@ class Engine:
                     missing_data_map["experience"] = "Опыт работы (количество месяцев, число)"
                 if not profile.get("readiness"): 
                     missing_data_map["readiness"] = "Готов ли работать нужное количество часов в неделю (от 15) (да/нет)"
-                
+                if profile.get("location_is_rf") is None:
+                    missing_data_map["location_is_rf"] = "Находится ли кандидат сейчас на территории РФ (да/нет)"
                 
 
                 # Если есть пробелы — запускаем точечный поиск в истории
@@ -1636,11 +1682,15 @@ class Engine:
 
                     Правило для опыта:
                     1. В "experience" верни количество месяцев опыта собеседника в холодных звонках. Если опыта в холодных звонках нет то 0.
+                    
+                    1. В "location_is_rf" верни "да", если кандидат подтвердил, что находится в России, или "нет", если он за границей.
+
                     Верни ответ ТОЛЬКО в формате JSON:
                     {
                         "age": <целое число или null>,
                         "citizenship": "<строка>",
                         "readiness": "<да/нет/none>",
+                        "location_is_rf": "<да/нет/none>",
                         "experience": <целое число или null>,
                         "reasoning": "<твое краткое обоснование>"
                     }
@@ -1666,18 +1716,21 @@ class Engine:
                         v_cit = v_data.get('citizenship')
                         v_ready = v_data.get('readiness')
                         v_exp = v_data.get('experience')
+                        v_loc = v_data.get('location_is_rf')
 
                         # Сравниваем аудит с тем, что у нас в БД (profile)
                         db_age = profile.get("age")
                         db_cit = profile.get("citizenship")
                         db_ready = profile.get("readiness")
                         db_exp = profile.get("experience")
+                        db_loc = profile.get("location_is_rf")
 
                         # Проверка на рассинхрон (сравниваем все важные поля)
                         is_sync_ok = (
                             db_age == v_age and 
                             str(db_cit).lower() == str(v_cit).lower() and
                             str(db_ready).lower() == str(v_ready).lower() and
+                            str(db_loc).lower() == str(v_loc).lower() and # Добавить это
                             db_exp == v_exp
                         )
                             
@@ -1760,8 +1813,8 @@ class Engine:
                 else:
                     # --- СЦЕНАРИЙ 2: ОТКАЗ ---
                     ctx_logger.info(
-                        f"[{dialogue.external_chat_id}] Отказ по критериям: Возраст={age_ok}, Гражд={citizenship_ok}, Суд={criminal_ok}",
-                        extra={"action": "qualification_failed_by_code"}
+                        f"[{dialogue.external_chat_id}] Отказ по критериям. Причина: {reason}",
+                        extra={"action": "qualification_failed_by_code", "reason": reason}
                     )
 
                     # Устанавливаем статус и вежливую фразу из ТЗ
@@ -1786,9 +1839,10 @@ class Engine:
                             dialogue_id=dialogue.id,
                             account_id=dialogue.account_id,
                             event_type='rejected_by_bot',
+
                             event_data={
                                 "reason": "eligibility_failed",
-                                "details": {"age": age, "cit": citizenship, "patent": has_patent, "crim": criminal}
+                                "details": {"reason_code": reason, "profile_snapshot": profile}
                             }
                         ))
                         ctx_logger.info(f"✅ Записано событие 'rejected_by_bot' для диалога {dialogue.id}.")
