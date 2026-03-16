@@ -293,6 +293,15 @@ class AvitoConnectorService:
             if not account:
                 logger.error(f"❌ Аккаунт не найден (ID: {avito_user_id})")
                 return
+                
+            # --- ШАГ 3. СИНХРОНИЗИРУЕМ ВАКАНСИЮ СРАЗУ (Чтобы она была доступна везде) ---
+            job_context = None
+            if item_id:
+                try:
+                    # Теперь вакансия обновляется ПРИ КАЖДОМ СОБЫТИИ
+                    job_context = await self._sync_vacancy(account, db, item_id)
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось обновить описание вакансии {item_id}: {e}")
 
             # 3. Ищем существующий диалог
             stmt = select(Dialogue).options(
@@ -386,21 +395,14 @@ class AvitoConnectorService:
                 elif extracted_fio and not candidate.full_name:
                     candidate.full_name = extracted_fio
 
-                # 5. Синхронизируем вакансию
-                job_context = None
-                if item_id:
-                    try:
-                        job_context = await self._sync_vacancy(account, db, item_id)
-                    except Exception:
-                        logger.info(f"ℹ️ Контекст объявления {item_id} не подтянут.")
-
+                
                 # 6. Биллинг и создание диалога
                 dialogue = await self._sync_dialogue_and_billing(
                     account, candidate, job_context, external_chat_id, db,
                     app_data if app_data else {},
                     trigger_source=source
                 )
-
+            
             # 7. Отправка в Engine (если чат не закрыт)
             if dialogue:
                 if dialogue.status == 'rejected':
