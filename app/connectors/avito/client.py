@@ -315,10 +315,10 @@ class AvitoClient:
 
         # Зарплата (может быть числом или объектом)
         salary = vac.get('salary')
-        if isinstance(salary, dict):
-            lines.append(f"💰 Доход: от {salary.get('from')} до {salary.get('to')} руб. Это не оклад!!! Мы платим 1500 рублей за организованную встречу с менеджером")
-        elif salary:
-            lines.append(f"💰 Доход: {salary} руб.")
+        # if isinstance(salary, dict):
+        #     lines.append(f"💰 Доход: от {salary.get('from')} до {salary.get('to')} руб. Это не оклад!!! Мы платим 1500 рублей за организованную встречу с менеджером")
+        # elif salary:
+        #     lines.append(f"💰 Доход: {salary} руб.")
         
         # Локация и координаты
         addr = vac.get('addressDetails', {})
