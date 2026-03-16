@@ -1435,7 +1435,7 @@ class Engine:
                             event_type='rejected_by_bot',
                             event_data={"reason": reason, "at_state": current_state_at_update}
                         ))
-                                
+                            
                 
                 await db.flush()
 
