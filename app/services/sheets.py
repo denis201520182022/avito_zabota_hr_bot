@@ -104,7 +104,39 @@ class GoogleSheetsService:
             raise e
 
     # --- МЕТОДЫ ДЛЯ КАЛЕНДАРЯ ---
+    async def update_candidate_date(self, phone: str, new_dt: str):
+        """ Находит кандидата по телефону и обновляет ему дату интервью (столбец E) """
+        try:
+            service = await asyncio.to_thread(self._get_service)
+            # Читаем весь лист кандидатов (столбцы A и B достаточно для поиска, но берем всё)
+            range_name = f"'{self.candidates_sheet}'!A:F"
+            result = await self._execute_google_call(
+                service.spreadsheets().values().get,
+                spreadsheetId=self._spreadsheet_id, range=range_name
+            )
+            rows = result.get('values', [])
 
+            for idx, row in enumerate(rows):
+                # Проверяем телефон (столбец B, индекс 1)
+                if len(row) > 1 and str(row[1]).strip() == str(phone).strip():
+                    row_number = idx + 1 # +1 т.к. в Google Sheets нумерация с 1
+                    update_range = f"'{self.candidates_sheet}'!E{row_number}" # Столбец E
+                    
+                    body = {'values': [[new_dt]]}
+                    await self._execute_google_call(
+                        service.spreadsheets().values().update,
+                        spreadsheetId=self._spreadsheet_id, range=update_range,
+                        valueInputOption="RAW", body=body
+                    )
+                    logger.info(f"✅ Дата в листе 'Кандидаты' обновлена для {phone} на {new_dt}")
+                    return True
+            
+            logger.warning(f"⚠️ Кандидат с телефоном {phone} не найден в списке для обновления даты.")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обновлении даты в листе Кандидаты: {e}")
+            return False
+        
     async def book_slot(self, target_date: str, target_time: str, candidate_name: str) -> bool:
         """Занимает слот"""
         return await self._update_slot_status(target_date, target_time, "Занято", candidate_name)

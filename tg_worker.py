@@ -214,19 +214,29 @@ async def handle_reporting_task(message_body: dict):
                 await send_tg_notification(dialogue, candidate, vacancy, account)
 
             elif event_type == 'rescheduled':
-                # 1. Google Sheets: Освобождаем старый слот
+                # 1. Google Sheets: Освобождаем старый слот в календаре
                 old_date = message_body.get("old_date")
                 old_time = message_body.get("old_time")
                 if old_date and old_time:
                     await sheets_service.release_slot(old_date, old_time, candidate.full_name)
                 
-                # 2. Google Sheets: Бронируем новый слот
+                # 2. Google Sheets: Бронируем новый слот в календаре
+                new_date = meta.get("interview_date")
+                new_time = meta.get("interview_time")
                 await sheets_service.book_slot(
-                    target_date=meta.get("interview_date"),
-                    target_time=meta.get("interview_time"),
+                    target_date=new_date,
+                    target_time=new_time,
                     candidate_name=f"{candidate.full_name or 'Аноним'}"
                 )
-                logger.info(f"🔄 Таблицы: Перенос для диалога {dialogue_id} выполнен")
+
+                # --- ВОТ ЭТОТ НОВЫЙ БЛОК ---
+                # 3. Google Sheets: Обновляем дату в общем списке кандидатов
+                if candidate.phone_number:
+                    new_dt_str = f"{new_date} {new_time}"
+                    await sheets_service.update_candidate_date(candidate.phone_number, new_dt_str)
+                # ---------------------------
+
+                logger.info(f"🔄 Таблицы: Перенос для диалога {dialogue_id} выполнен везде")
 
             elif event_type == 'cancelled':
                 # Google Sheets: Освобождаем текущий слот при отказе
