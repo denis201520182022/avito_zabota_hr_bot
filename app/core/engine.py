@@ -910,17 +910,7 @@ class Engine:
 
                         # 2. Сохраняем команду в историю
                         dialogue.history = (dialogue.history or []) + [sys_phone_cmd]
-                        dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
-                        
-                        # 3. Фиксируем в БД и отправляем на немедленную перегенерацию ответа
-                        await db.commit()
-                        await mq.publish("engine_tasks", {
-                            "dialogue_id": dialogue.id, 
-                            "trigger": "invalid_phone_retry"
-                        })
-                        
-                        ctx_logger.info(f"♻️ Отправлено на переспрос телефона (неверный формат).")
-                        return # ПРЕРЫВАЕМ текущую обработку, так как бот сейчас ответит по системной команде
+                        ctx_logger.info(f"📝 Инструкция по переспросу телефона добавлена в контекст текущего запроса.")
 
                 # Собираем текст для отправки в LLM (если номер был валидным или его не было вовсе)
                 all_masked_content.append(masked_content)
