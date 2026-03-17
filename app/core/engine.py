@@ -727,7 +727,7 @@ class Engine:
                     selectinload(Dialogue.reminders),   # InterviewReminder
                     selectinload(Dialogue.followups)    # InterviewFollowup
                 )
-                .with_for_update(skip_locked=True)      # Блокируем строку от других воркеров
+                .with_for_update()      # Блокируем строку от других воркеров
             )
             
             result = await db.execute(stmt)
