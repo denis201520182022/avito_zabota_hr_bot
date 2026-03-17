@@ -141,7 +141,7 @@ class Scheduler:
                             })
 
                             # Обновляем уровень в БД сразу, чтобы не слать дубли в следующем цикле
-                            # dialogue.reminder_level = new_level
+                            #dialogue.reminder_level = new_level
                             
                             if reminder_cfg.stop_bot:
                                 dialogue.status = 'timed_out'
@@ -164,7 +164,7 @@ class Scheduler:
                 except: pass
             
             
-            await asyncio.sleep(30)
+            await asyncio.sleep(300)
 
     # --- 2. НАПОМИНАНИЯ ПЕРЕД СОБЕСЕДОВАНИЕМ ---
     async def _loop_interview_reminders(self):
