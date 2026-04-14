@@ -92,6 +92,12 @@ class Settings(BaseModel):
     AVITO_WEBHOOK_SECRET: str = Field(default_factory=lambda: os.getenv("AVITO_WEBHOOK_SECRET", "")) # <--- ДОБАВЛЕНО
     OPENAI_API_KEY: str = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))             # <--- ДОБАВЛЕНО
 
+    # Настройки прокси для Telegram бота
+    SQUID_PROXY_HOST: Optional[str] = Field(default_factory=lambda: os.getenv("SQUID_PROXY_HOST"))
+    SQUID_PROXY_PORT: Optional[str] = Field(default_factory=lambda: os.getenv("SQUID_PROXY_PORT"))
+    SQUID_PROXY_USER: Optional[str] = Field(default_factory=lambda: os.getenv("SQUID_PROXY_USER"))
+    SQUID_PROXY_PASSWORD: Optional[str] = Field(default_factory=lambda: os.getenv("SQUID_PROXY_PASSWORD"))
+
     @classmethod
     def load(cls, path: str = "config.yaml"):
         if not Path(path).exists():

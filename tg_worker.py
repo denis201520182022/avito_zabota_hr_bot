@@ -4,12 +4,12 @@ import logging
 import io
 import datetime
 import time
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
+from aiogram.client.session import AiohttpSession
 from aiogram.types import BufferedInputFile
+from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from aiogram import Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
 from app.tg_bot.handlers import router as main_router
 from app.tg_bot.middlewares import DbSessionMiddleware
 import html  # Добавь в импорты наверху
@@ -24,7 +24,20 @@ from app.services.sheets import sheets_service
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("ReportingWorker")
 
-bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+# --- Настройка прокси-сессии для бота ---
+session = None
+if settings.SQUID_PROXY_HOST and settings.SQUID_PROXY_PORT:
+    # Очищаем кавычки, если они есть в .env
+    host = settings.SQUID_PROXY_HOST.strip('"')
+    port = settings.SQUID_PROXY_PORT.strip('"')
+    user = settings.SQUID_PROXY_USER.strip('"') if settings.SQUID_PROXY_USER else ""
+    password = settings.SQUID_PROXY_PASSWORD.strip('"') if settings.SQUID_PROXY_PASSWORD else ""
+    
+    proxy_url = f"http://{user}:{password}@{host}:{port}"
+    session = AiohttpSession(proxy=proxy_url)
+    logging.info(f"🌐 Бот запущен через прокси: {host}:{port}")
+
+bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, session=session)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -109,9 +122,6 @@ def format_history_txt(dialogue: Dialogue, candidate: Candidate, vacancy: JobCon
 
     return "\n".join(lines)
 
-
-
-import html  # Добавь в импорты наверху
 
 async def send_tg_notification(dialogue: Dialogue, candidate: Candidate, vacancy: JobContext, account: Account):
     """Логика формирования и отправки карточки в Telegram"""
